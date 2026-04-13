@@ -88,10 +88,11 @@ router.post('/start', upload.single('file'), async (req, res) => {
 
       // Wait for Claude first (usually faster)
       const fiche = await claudePromise;
+      console.log('[analyze] fiche result:', fiche ? Object.keys(fiche).join(', ') : 'NULL');
       if (fiche) {
-        const current = jobs.get(jobId) || {};
+        const cur1 = jobs.get(jobId) || {};
         jobs.set(jobId, {
-          ...current,
+          ...cur1,
           status: 'partial',
           stage: 'fiche_done',
           progress: 'Rapport IA prêt',
@@ -100,20 +101,21 @@ router.post('/start', upload.single('file'), async (req, res) => {
         });
       }
 
-      // Wait for Gemini
+      // Wait for listening analysis
       const listening = await geminiPromise;
-      const current = jobs.get(jobId) || {};
+      console.log('[analyze] listening result:', listening ? 'OK' : 'NULL');
+      const cur2 = jobs.get(jobId) || {};
       jobs.set(jobId, {
-        ...current,
+        ...cur2,
         status: 'complete',
         stage: 'all_done',
         progress: 'Terminé',
         pct: 100,
-        fiche: current.fiche || fiche,
+        fiche: cur2.fiche || fiche,
         listening: listening || null,
       });
 
-      console.log('[analyze] done — keys:', Object.keys(current.fiche || fiche || {}).join(', '));
+      console.log('[analyze] done — keys:', Object.keys(cur2.fiche || fiche || {}).join(', '));
     } catch (err) {
       console.error('[analyze] error:', err.message);
       jobs.set(jobId, { status: 'error', error: err.message });
