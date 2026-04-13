@@ -70,7 +70,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
         if (!fileBuffer) return null;
         try {
           const listening = await analyzeListening(
-            fileBuffer.toString('base64'),
+            fileBuffer,
             fileMime,
             title || '',
             artist || '',
