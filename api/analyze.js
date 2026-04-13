@@ -78,10 +78,10 @@ router.post('/start', upload.single('file'), async (req, res) => {
             mode,
             daw
           );
-          console.log('[analyze] gemini done');
+          console.log('[analyze] listening done');
           return listening;
         } catch (err) {
-          console.error('[analyze] gemini error:', err.message);
+          console.error('[analyze] listening error:', err.message);
           return null;
         }
       })();
