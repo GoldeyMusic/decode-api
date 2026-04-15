@@ -79,7 +79,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
       // ── STAGE 3: Claude fiche (uses listening + pmContext) ─
       let fiche = null;
       try {
-        fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext);
+        let previousFiche = null; try { previousFiche = req.body.previousFiche ? JSON.parse(req.body.previousFiche) : null; } catch {} fiche = await generateFiche(mode, daw, title || "Titre inconnu", artist, listening, pmContext, previousFiche);
         console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
       } catch (err) {
         console.error('[analyze] claude error:', err.message);
