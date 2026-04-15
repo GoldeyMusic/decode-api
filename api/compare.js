@@ -41,6 +41,7 @@ Réponds UNIQUEMENT avec un JSON valide, sans markdown, sans texte avant/après 
 Règles :
 - Max 5 items par catégorie. Souvent beaucoup moins.
 - Si une catégorie est vide, renvoie [].
+- TON : ecris comme un producteur qui raconte les changements a un confrere, pas comme un script. Phrases courantes, formulations naturelles, jamais de "score X en hausse" ou de "element Y apparu" mecaniques. Prefere "Tu as ajoute des chœurs sur les refrains", "La voix lead respire mieux", "Le mix global gagne en cohesion". Le titre de chaque item peut etre court mais le detail est une vraie phrase d analyste, pas une etiquette technique.
 - Pas de mention de "Gemini", "Claude", "IA", "LLM", "elements_detectes" (jamais ce mot dans le texte affiche, parle d "elements detectes" ou "elements entendus"), ni du process interne.
 - Français.`;
 
