@@ -3,6 +3,7 @@ const multer = require('multer');
 const { generateFiche } = require('../lib/claude');
 const { analyzeListening } = require('../lib/gemini');
 const { retrievePureMixContext, formatContextForPrompt } = require('../lib/rag');
+const { transcodeAndUpload } = require('../lib/audio-storage');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
@@ -10,6 +11,7 @@ const jobs = new Map();
 function makeJobId() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
 // Flow: Gemini (ecoute) -> RAG PureMix (extraits pertinents) -> Claude (fiche enrichie).
+// En parallèle de RAG+Claude: transcodage MP3 + upload Supabase Storage.
 router.post('/start', upload.single('file'), async (req, res) => {
   const jobId = makeJobId();
   jobs.set(jobId, { status: 'pending', progress: 'Démarrage…', pct: 0 });
@@ -21,6 +23,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
       const title = req.body.title || (req.file ? req.file.originalname.replace(/\.[^/.]+$/, '') : '');
       const version = req.body.version || '';
       const artist = req.body.artist || '';
+      const userId = req.body.userId || null;
       let fileBuffer = null, fileMime = null;
 
       if (req.file) {
@@ -56,6 +59,17 @@ router.post('/start', upload.single('file'), async (req, res) => {
         listening: listening || null,
       });
 
+      // ── STAGE PARALLÈLE: transcodage MP3 + upload Supabase ──
+      // Lancé en parallèle de RAG+Claude pour ne pas ajouter à la latence perçue.
+      let storagePromise = null;
+      if (fileBuffer && userId) {
+        storagePromise = transcodeAndUpload({ fileBuffer, fileMime, userId })
+          .then((path) => { console.log('[analyze] audio stored:', path); return path; })
+          .catch((err) => { console.error('[analyze] storage error:', err.message); return null; });
+      } else if (!userId) {
+        console.warn('[analyze] no userId, skipping audio upload');
+      }
+
       // ── STAGE 2: RAG PureMix context ───────────
       let pmChunks = [];
       if (listening) {
@@ -85,6 +99,9 @@ router.post('/start', upload.single('file'), async (req, res) => {
         console.error('[analyze] claude error:', err.message);
       }
 
+      // Attend la fin du transcodage/upload (peut avoir fini depuis longtemps)
+      const storagePath = storagePromise ? await storagePromise : null;
+
       const cur2 = jobs.get(jobId) || {};
       jobs.set(jobId, {
         ...cur2,
@@ -92,6 +109,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
         progress: 'Terminé', pct: 100,
         fiche: fiche || null,
         listening: listening || null,
+        storagePath: storagePath || null,
         // On renvoie les sources citees (sans le contenu complet) pour eventuel affichage
         pmSources: pmChunks.map(c => ({
           source_file: c.source_file,
