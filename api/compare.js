@@ -41,7 +41,7 @@ Réponds UNIQUEMENT avec un JSON valide, sans markdown, sans texte avant/après 
 Règles :
 - Max 5 items par catégorie. Souvent beaucoup moins.
 - Si une catégorie est vide, renvoie [].
-- Pas de mention de "Gemini", "Claude", "IA", "LLM", "elements_detectes", ni du process interne.
+- Pas de mention de "Gemini", "Claude", "IA", "LLM", "elements_detectes" (jamais ce mot dans le texte affiche, parle d "elements detectes" ou "elements entendus"), ni du process interne.
 - Français.`;
 
 router.post('/', async (req, res) => {
