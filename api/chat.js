@@ -2,6 +2,16 @@ const express = require('express');
 const { chat } = require('../lib/claude');
 const router = express.Router();
 
+// Tente de charger le RAG PureMix (peut ne pas exister dans tous les envs)
+let retrievePureMixContext, formatContextForPrompt;
+try {
+  const rag = require('../lib/rag');
+  retrievePureMixContext = rag.retrievePureMixContext;
+  formatContextForPrompt = rag.formatContextForPrompt;
+} catch (e) {
+  console.warn('[chat] RAG PureMix indisponible:', e.message);
+}
+
 router.post('/', async (req, res) => {
   try {
     const { messages, item, daw, fadrData, listening, fiche, title, artist, version } = req.body;
@@ -10,7 +20,7 @@ router.post('/', async (req, res) => {
     let system;
 
     // Chat "version-wide" : l'utilisateur pose des questions sur la version affichée.
-    // On envoie à Claude l'écoute qualitative + la fiche d'analyse comme contexte.
+    // On envoie à Claude l'écoute qualitative + la fiche d'analyse + PureMix comme contexte.
     if (listening || fiche) {
       const parts = [
         `Tu es l'assistant Versions, ingénieur du son expert (20+ ans d'expérience), intégré dans une app d'analyse de production musicale.`,
@@ -20,6 +30,32 @@ router.post('/', async (req, res) => {
       if (version) parts.push(`Version affichée : ${version}.`);
       if (listening) parts.push(`\n\n--- ÉCOUTE QUALITATIVE DE CE MORCEAU ---\n${JSON.stringify(listening, null, 2)}`);
       if (fiche) parts.push(`\n\n--- FICHE D'ANALYSE ACTUELLE (diagnostic + plan d'action) ---\n${JSON.stringify(fiche, null, 2)}`);
+
+      // RAG PureMix : recherche de contexte pertinent pour enrichir la réponse
+      if (retrievePureMixContext && listening) {
+        try {
+          const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+          const query = lastUserMsg?.content || lastUserMsg?.text || '';
+          // On crée un mini-objet listening centré sur la question pour le RAG
+          const ragInput = query
+            ? { summary: query, observations: [query] }
+            : listening;
+          const pmChunks = await retrievePureMixContext(ragInput);
+          if (pmChunks && pmChunks.length > 0) {
+            const pmContext = formatContextForPrompt(pmChunks);
+            if (pmContext) {
+              parts.push(
+                `\n\n--- EXTRAITS DE COURS PUREMIX (transcripts d'ingénieurs de mix réels) ---\n${pmContext}\n` +
+                `Ces extraits viennent d'ingénieurs de mix professionnels. Tu peux t'en inspirer pour enrichir ta réponse, ` +
+                `mais ne les cite jamais verbatim et ne les attribue pas nominativement. Reformule avec tes propres mots.`
+              );
+            }
+          }
+        } catch (err) {
+          console.warn('[chat] RAG PureMix error:', err.message);
+        }
+      }
+
       parts.push(
         `\n\nL'utilisateur te pose des questions sur ce morceau, cette analyse, ou la production en général. ` +
         `Ancre tes réponses dans le contexte ci-dessus quand c'est pertinent. Sois direct, concis, actionnable. ` +
