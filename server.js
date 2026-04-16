@@ -18,4 +18,5 @@ app.use('/api/chat', require('./api/chat'));
 app.use('/api/ask', require('./api/ask'));
 app.use('/api/listen', require('./api/listen'));
 app.use('/api/compare', require('./api/compare'));
+app.use('/api/audio', require('./api/audio-signed-url'));
 app.listen(PORT, () => console.log(`Decode API running on port ${PORT}`));
