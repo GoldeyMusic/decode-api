@@ -24,6 +24,11 @@ router.post('/start', upload.single('file'), async (req, res) => {
       const version = req.body.version || '';
       const artist = req.body.artist || '';
       const userId = req.body.userId || null;
+      // Type vocal du titre (migration 004) : 'vocal' (défaut), 'instrumental_pending', 'instrumental_final'
+      // Utilisé pour adapter Gemini + Claude : pas de mention de voix sur un instru définitif,
+      // voix traitée comme étape à venir (non pénalisante) sur un instru temporaire.
+      const allowedVocalTypes = ['vocal', 'instrumental_pending', 'instrumental_final'];
+      const vocalType = allowedVocalTypes.includes(req.body.vocalType) ? req.body.vocalType : 'vocal';
       let fileBuffer = null, fileMime = null;
 
       if (req.file) {
@@ -43,7 +48,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
       let listening = null;
       if (fileBuffer) {
         try {
-          listening = await analyzeListening(fileBuffer, fileMime, title || '', artist || '', mode);
+          listening = await analyzeListening(fileBuffer, fileMime, title || '', artist || '', mode, vocalType);
           console.log('[analyze] listening done');
         } catch (err) {
           console.error('[analyze] listening error:', err.message);
@@ -93,7 +98,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
       // ── STAGE 3: Claude fiche (uses listening + pmContext) ─
       let fiche = null;
       try {
-        const durationSeconds = parseFloat(req.body.durationSeconds) || null; let previousFiche = null; try { previousFiche = req.body.previousFiche ? JSON.parse(req.body.previousFiche) : null; } catch {} fiche = await generateFiche(mode, daw, title || "Titre inconnu", artist, listening, pmContext, previousFiche); if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
+        const durationSeconds = parseFloat(req.body.durationSeconds) || null; let previousFiche = null; try { previousFiche = req.body.previousFiche ? JSON.parse(req.body.previousFiche) : null; } catch {} fiche = await generateFiche(mode, daw, title || "Titre inconnu", artist, listening, pmContext, previousFiche, vocalType); if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
         console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
       } catch (err) {
         console.error('[analyze] claude error:', err.message);
