@@ -124,7 +124,12 @@ ${JSON.stringify(content, null, 2)}`;
 
     // Fiche et écoute peuvent être volumineuses (2-4k tokens) → on augmente
     // largement la limite pour éviter les troncatures qui cassent le JSON.
-    const raw = await chat([{ role: 'user', content: userMsg }], system, { maxTokens: 8000 });
+    // Modèle Haiku : 3-4× plus rapide que Sonnet, largement suffisant pour
+    // de la traduction avec contraintes structurelles.
+    const raw = await chat([{ role: 'user', content: userMsg }], system, {
+      maxTokens: 8000,
+      model: 'claude-haiku-4-5-20251001',
+    });
 
     let parsed;
     try {
