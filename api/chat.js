@@ -1,5 +1,5 @@
 const express = require('express');
-const { chat } = require('../lib/claude');
+const { chat, buildLocaleInstruction } = require('../lib/claude');
 const router = express.Router();
 
 // Tente de charger le RAG PureMix (peut ne pas exister dans tous les envs)
@@ -16,6 +16,13 @@ router.post('/', async (req, res) => {
   try {
     const { messages, item, daw, fadrData, listening, fiche, title, artist, version } = req.body;
     if (!messages) return res.status(400).json({ error: 'messages required' });
+
+    const locale = (req.body.locale || 'fr').toString().toLowerCase().slice(0, 2);
+    const isEn = locale === 'en';
+    // Bloc "réponds en langue X" préfixé au system prompt.
+    const chatLocaleInstruction = isEn
+      ? `LANGUAGE OF OUTPUT: respond entirely in ENGLISH. Do not switch languages mid-message.\n\n`
+      : '';
 
     let system;
 
@@ -69,10 +76,11 @@ router.post('/', async (req, res) => {
       system = parts.join(' ');
     } else {
       // Fallback rétrocompatibilité : ancien chat "per item" du drawer (toujours en prod sur decode-app).
-      system = `Tu es l'assistant Decode, expert production musicale. DAW: ${daw || 'Logic Pro'}. Élément: ${item?.label || ''}. ${item?.detail || ''} ${fadrData ? `BPM: ${fadrData.bpm}, Tonalité: ${fadrData.key}` : ''} Réponds en français, paramètres précis, alternative gratuite pour chaque plugin.`;
+      const langDirective = isEn ? 'Respond in English' : 'Réponds en français';
+      system = `Tu es l'assistant Decode, expert production musicale. DAW: ${daw || 'Logic Pro'}. Élément: ${item?.label || ''}. ${item?.detail || ''} ${fadrData ? `BPM: ${fadrData.bpm}, Tonalité: ${fadrData.key}` : ''} ${langDirective}, paramètres précis, alternative gratuite pour chaque plugin.`;
     }
 
-    return res.json({ reply: await chat(messages, system) });
+    return res.json({ reply: await chat(messages, chatLocaleInstruction + system) });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

@@ -1,5 +1,5 @@
 const express = require('express');
-const { chat } = require('../lib/claude');
+const { chat, buildLocaleInstruction } = require('../lib/claude');
 const router = express.Router();
 
 const SYSTEM_PROMPT = `Tu compares deux fiches d'analyse d'un même titre musical (A = version antérieure, B = version plus récente).
@@ -42,17 +42,32 @@ Règles :
 - Max 5 items par catégorie. Souvent beaucoup moins.
 - Si une catégorie est vide, renvoie [].
 - TON : ecris comme un producteur qui raconte les changements a un confrere, pas comme un script. Phrases courantes, formulations naturelles, jamais de "score X en hausse" ou de "element Y apparu" mecaniques. Prefere "Tu as ajoute des chœurs sur les refrains", "La voix lead respire mieux", "Le mix global gagne en cohesion". Le titre de chaque item peut etre court mais le detail est une vraie phrase d analyste, pas une etiquette technique.
-- Pas de mention de "Gemini", "Claude", "IA", "LLM", "elements_detectes" (jamais ce mot dans le texte affiche, parle d "elements detectes" ou "elements entendus"), ni du process interne.
-- Français.`;
+- Pas de mention de "Gemini", "Claude", "IA", "LLM", "elements_detectes" (jamais ce mot dans le texte affiche, parle d "elements detectes" ou "elements entendus"), ni du process interne.`;
+
+// Instruction de langue spécifique compare : les textes "resume", "titre" et
+// "detail" doivent être dans la langue demandée. Les clés JSON restent FR.
+function buildCompareLocaleBlock(locale) {
+  const norm = (locale || '').toString().toLowerCase().slice(0, 2);
+  if (norm === 'en') {
+    return `LANGUAGE OF OUTPUT (hard rule): write every human-visible string value ("resume", each "titre", each "detail") in ENGLISH. Keep JSON keys exactly as specified (they are code identifiers).\n\n`;
+  }
+  return `Réponds en français.\n\n`;
+}
 
 router.post('/', async (req, res) => {
   try {
     const { ficheA, ficheB, nameA, nameB } = req.body;
     if (!ficheA || !ficheB) return res.status(400).json({ error: 'ficheA et ficheB requis' });
 
+    const locale = (req.body.locale || 'fr').toString().toLowerCase().slice(0, 2);
+    const localeBlock = buildCompareLocaleBlock(locale);
+    // On concatène: (1) la directive de langue en tête, (2) le prompt FR calibré,
+    // (3) la ligne "Français." ou équivalent langue.
+    const systemWithLocale = `${localeBlock}${SYSTEM_PROMPT}`;
+
     const userMsg = `VERSION A (${nameA || 'A'}) :\n${JSON.stringify(ficheA, null, 2)}\n\nVERSION B (${nameB || 'B'}) :\n${JSON.stringify(ficheB, null, 2)}\n\nApplique la méthode obligatoire : commence par diffuser elements_detectes famille par famille, puis les scores, puis le plan. Réponds en JSON strict.`;
 
-    const raw = await chat([{ role: 'user', content: userMsg }], SYSTEM_PROMPT);
+    const raw = await chat([{ role: 'user', content: userMsg }], systemWithLocale);
 
     let parsed;
     try {
