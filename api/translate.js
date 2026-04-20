@@ -122,7 +122,9 @@ FORMAT DE SORTIE : JSON valide uniquement. Pas de markdown, pas de backticks, pa
 JSON SOURCE :
 ${JSON.stringify(content, null, 2)}`;
 
-    const raw = await chat([{ role: 'user', content: userMsg }], system);
+    // Fiche et écoute peuvent être volumineuses (2-4k tokens) → on augmente
+    // largement la limite pour éviter les troncatures qui cassent le JSON.
+    const raw = await chat([{ role: 'user', content: userMsg }], system, { maxTokens: 8000 });
 
     let parsed;
     try {
