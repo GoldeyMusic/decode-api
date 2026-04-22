@@ -1,6 +1,6 @@
 const express = require('express');
 const multer = require('multer');
-const { generateFiche, formulatePerception } = require('../lib/claude');
+const { generateFiche } = require('../lib/claude');
 const { analyzeListening } = require('../lib/gemini');
 const { retrievePureMixContext, formatContextForPrompt } = require('../lib/rag');
 const { transcodeAndUpload } = require('../lib/audio-storage');
@@ -10,14 +10,8 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200
 const jobs = new Map();
 function makeJobId() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
-// Flow (pipeline en 2 phases) :
-//   Phase A  — Gemini (ecoute) -> RAG PureMix -> Claude.formulatePerception -> job passe en 'awaiting_intent'
-//              (transcodage MP3 + upload Supabase lances en parallele)
-//   [attente de POST /diagnose/:jobId avec l intention de l utilisateur (ou skip)]
-//   Phase B  — Claude.generateFiche(..., intent) -> job 'complete'
-//
-// Retro-compat : POST /start avec body field `skipIntent=true` enchaine les 2 phases
-// comme avant (pratique pour tests curl ou pour le front tant qu il n expose pas l ecran intention).
+// Flow: Gemini (ecoute) -> RAG PureMix (extraits pertinents) -> Claude (fiche enrichie).
+// En parallèle de RAG+Claude: transcodage MP3 + upload Supabase Storage.
 router.post('/start', upload.single('file'), async (req, res) => {
   const jobId = makeJobId();
   jobs.set(jobId, { status: 'pending', progress: 'Démarrage…', pct: 0 });
@@ -30,16 +24,16 @@ router.post('/start', upload.single('file'), async (req, res) => {
       const version = req.body.version || '';
       const artist = req.body.artist || '';
       const userId = req.body.userId || null;
-      const skipIntent = req.body.skipIntent === 'true' || req.body.skipIntent === true;
-      const durationSeconds = parseFloat(req.body.durationSeconds) || null;
-      let previousFiche = null;
-      try { previousFiche = req.body.previousFiche ? JSON.parse(req.body.previousFiche) : null; } catch {}
-      // Intention inline (fournie avant analyse, ex: heritee du titre pour une V2+)
-      const inlineIntent = typeof req.body.intent === 'string' && req.body.intent.trim().length > 0
-        ? req.body.intent.trim()
-        : null;
-
+      // Type vocal du titre (migration 004) : 'vocal' (défaut), 'instrumental_pending', 'instrumental_final'
+      // Utilisé pour adapter Gemini + Claude : pas de mention de voix sur un instru définitif,
+      // voix traitée comme étape à venir (non pénalisante) sur un instru temporaire.
+      const allowedVocalTypes = ['vocal', 'instrumental_pending', 'instrumental_final'];
+      const vocalType = allowedVocalTypes.includes(req.body.vocalType) ? req.body.vocalType : 'vocal';
+      // Langue des textes visibles produits (labels, verdicts, summaries…). Les prompts
+      // détaillés restent en FR, on ajoute juste une directive en tête du system prompt.
+      const locale = (req.body.locale || 'fr').toString().toLowerCase().slice(0, 2);
       let fileBuffer = null, fileMime = null;
+
       if (req.file) {
         fileBuffer = req.file.buffer;
         fileMime = req.file.mimetype || 'audio/mpeg';
@@ -57,7 +51,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
       let listening = null;
       if (fileBuffer) {
         try {
-          listening = await analyzeListening(fileBuffer, fileMime, title || '', artist || '', mode);
+          listening = await analyzeListening(fileBuffer, fileMime, title || '', artist || '', mode, vocalType, locale);
           console.log('[analyze] listening done');
         } catch (err) {
           console.error('[analyze] listening error:', err.message);
@@ -69,12 +63,12 @@ router.post('/start', upload.single('file'), async (req, res) => {
         ...cur1,
         status: 'partial', stage: 'listening_done',
         progress: listening ? 'Écoute qualitative prête' : 'Écoute indisponible',
-        pct: 55,
+        pct: 60,
         listening: listening || null,
       });
 
       // ── STAGE PARALLÈLE: transcodage MP3 + upload Supabase ──
-      // Lancé en parallèle du reste pour ne pas ajouter à la latence perçue.
+      // Lancé en parallèle de RAG+Claude pour ne pas ajouter à la latence perçue.
       let storagePromise = null;
       if (fileBuffer && userId) {
         storagePromise = transcodeAndUpload({ fileBuffer, fileMime, userId })
@@ -101,49 +95,37 @@ router.post('/start', upload.single('file'), async (req, res) => {
         ...cur15,
         stage: 'rag_done',
         progress: 'Contexte PureMix prêt',
-        pct: 65,
+        pct: 75,
       });
 
-      // ── PHASE A FINALE : perception formulée (optionnelle, activee seulement si
-      //    on ne saute pas l etape intention et qu on n a PAS recu d intention inline) ──
-      const shouldAwaitIntent = !skipIntent && !inlineIntent;
-
-      if (shouldAwaitIntent) {
-        let perception = null;
-        try {
-          perception = await formulatePerception(listening);
-          console.log('[analyze] perception formulée');
-        } catch (err) {
-          console.error('[analyze] perception error:', err.message);
-          perception = null; // on passe quand meme en awaiting_intent, le front saura gérer
-        }
-
-        // Stocke dans le job tout ce dont la Phase B aura besoin
-        const curA = jobs.get(jobId) || {};
-        jobs.set(jobId, {
-          ...curA,
-          status: 'awaiting_intent', stage: 'awaiting_intent',
-          progress: 'En attente de ton intention artistique…',
-          pct: 70,
-          perception: perception || null,
-          // Contexte de reprise pour /diagnose/:jobId
-          ctx: {
-            mode, daw, title, artist, version,
-            durationSeconds, previousFiche,
-            listening, pmContext, pmChunks, storagePromise,
-          },
-        });
-        return; // on ATTEND un POST /diagnose/:jobId pour reprendre
+      // ── STAGE 3: Claude fiche (uses listening + pmContext) ─
+      let fiche = null;
+      try {
+        const durationSeconds = parseFloat(req.body.durationSeconds) || null; let previousFiche = null; try { previousFiche = req.body.previousFiche ? JSON.parse(req.body.previousFiche) : null; } catch {} fiche = await generateFiche(mode, daw, title || "Titre inconnu", artist, listening, pmContext, previousFiche, vocalType, locale); if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
+        console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
+      } catch (err) {
+        console.error('[analyze] claude error:', err.message);
       }
 
-      // ── PHASE B enchainee (skipIntent ou intention inline) ──
-      await runDiagnosticPhase(jobId, {
-        mode, daw, title, artist, version,
-        durationSeconds, previousFiche,
-        listening, pmContext, pmChunks,
-        storagePromise,
-        intent: inlineIntent, // null si skip
+      // Attend la fin du transcodage/upload (peut avoir fini depuis longtemps)
+      const storagePath = storagePromise ? await storagePromise : null;
+
+      const cur2 = jobs.get(jobId) || {};
+      jobs.set(jobId, {
+        ...cur2,
+        status: 'complete', stage: 'all_done',
+        progress: 'Terminé', pct: 100,
+        fiche: fiche || null,
+        listening: listening || null,
+        storagePath: storagePath || null,
+        // On renvoie les sources citees (sans le contenu complet) pour eventuel affichage
+        pmSources: pmChunks.map(c => ({
+          source_file: c.source_file,
+          category: c.category,
+          similarity: c.similarity,
+        })),
       });
+      console.log('[analyze] done');
     } catch (err) {
       console.error('[analyze] error:', err.message);
       jobs.set(jobId, { status: 'error', error: err.message });
@@ -151,90 +133,10 @@ router.post('/start', upload.single('file'), async (req, res) => {
   })();
 });
 
-// ─── POST /diagnose/:jobId — reprend un job en 'awaiting_intent' et execute la Phase B ───
-// body: { intent: string|null }
-// Si intent est vide/null, on lance le diagnostic en lecture neutre (equivalent skip).
-router.post('/diagnose/:jobId', express.json(), (req, res) => {
-  const jobId = req.params.jobId;
-  const job = jobs.get(jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  if (job.status !== 'awaiting_intent' || !job.ctx) {
-    return res.status(409).json({ error: 'Job not in awaiting_intent state', status: job.status });
-  }
-
-  const intent = typeof req.body?.intent === 'string' && req.body.intent.trim().length > 0
-    ? req.body.intent.trim()
-    : null;
-
-  // Marquage immediat pour que le front voie la transition
-  jobs.set(jobId, {
-    ...job,
-    status: 'pending', stage: 'diagnosing',
-    progress: 'Diagnostic calibré en cours…',
-    pct: 80,
-  });
-  res.json({ ok: true, jobId, intent_used: intent });
-
-  // Execution en tache de fond (comme /start)
-  (async () => {
-    try {
-      await runDiagnosticPhase(jobId, { ...job.ctx, intent });
-    } catch (err) {
-      console.error('[diagnose] error:', err.message);
-      jobs.set(jobId, { ...(jobs.get(jobId) || {}), status: 'error', error: err.message });
-    }
-  })();
-});
-
-// Execute Claude.generateFiche + attend le transcodage + marque le job complete.
-// Utilise par /start (skipIntent) et par /diagnose/:jobId.
-async function runDiagnosticPhase(jobId, ctx) {
-  const {
-    mode, daw, title, artist,
-    durationSeconds, previousFiche,
-    listening, pmContext, pmChunks,
-    storagePromise,
-    intent,
-  } = ctx;
-
-  // ── STAGE 3: Claude fiche (listening + pmContext + intent) ──
-  let fiche = null;
-  try {
-    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null);
-    if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
-    console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
-  } catch (err) {
-    console.error('[analyze] claude error:', err.message);
-  }
-
-  // Attend la fin du transcodage/upload (peut avoir fini depuis longtemps)
-  const storagePath = storagePromise ? await storagePromise : null;
-
-  const cur = jobs.get(jobId) || {};
-  jobs.set(jobId, {
-    ...cur,
-    status: 'complete', stage: 'all_done',
-    progress: 'Terminé', pct: 100,
-    fiche: fiche || null,
-    listening: listening || null,
-    storagePath: storagePath || null,
-    intent_used: intent || null, // utile pour le front
-    pmSources: (pmChunks || []).map(c => ({
-      source_file: c.source_file,
-      category: c.category,
-      similarity: c.similarity,
-    })),
-    ctx: undefined, // on purge pour eviter de garder le listening en memoire plus longtemps
-  });
-  console.log('[analyze] done');
-}
-
 router.get('/status/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
-  // On ne renvoie PAS `ctx` au front (trop lourd, contient listening + pmContext).
-  const { ctx, ...publicJob } = job;
-  res.json(publicJob);
+  res.json(job);
   if (job.status === 'complete' || job.status === 'error') {
     setTimeout(() => jobs.delete(req.params.jobId), 60000);
   }
