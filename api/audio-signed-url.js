@@ -20,9 +20,12 @@ router.get('/signed-url', async (req, res) => {
   }
 
   try {
+    // TTL 24h : l'URL reste stable le temps d'une journée de travail, donc
+    // le navigateur conserve son cache HTTP (mêmes params de requête) au lieu
+    // de re-télécharger le fichier à chaque renouvellement d'URL signée.
     const { data, error } = await supabase.storage
       .from('audio')
-      .createSignedUrl(path, 3600); // 1h
+      .createSignedUrl(path, 86400); // 24h
 
     if (error) {
       console.error('[audio] signed-url error:', error.message);
