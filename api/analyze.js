@@ -1,6 +1,6 @@
 const express = require('express');
 const multer = require('multer');
-const { generateFiche, formulatePerception } = require('../lib/claude');
+const { generateFiche, formulatePerception, generateEvolution } = require('../lib/claude');
 const { analyzeListening } = require('../lib/gemini');
 const { retrievePureMixContext, formatContextForPrompt } = require('../lib/rag');
 const { transcodeAndUpload } = require('../lib/audio-storage');
@@ -34,6 +34,18 @@ router.post('/start', upload.single('file'), async (req, res) => {
       const durationSeconds = parseFloat(req.body.durationSeconds) || null;
       let previousFiche = null;
       try { previousFiche = req.body.previousFiche ? JSON.parse(req.body.previousFiche) : null; } catch {}
+      // previousAnalysisResult : { fiche, listening } de la version precedente du meme titre.
+      // Sert a generer le bandeau "evolution depuis V_n-1" (suivi inter-versions).
+      // Si absent : pas d evolution generee, pipeline identique a avant.
+      let previousAnalysisResult = null;
+      try {
+        previousAnalysisResult = req.body.previousAnalysisResult
+          ? JSON.parse(req.body.previousAnalysisResult)
+          : null;
+      } catch {}
+      const locale = typeof req.body.locale === 'string' && req.body.locale.trim().length > 0
+        ? req.body.locale.trim()
+        : 'fr';
       // Intention inline (fournie avant analyse, ex: heritee du titre pour une V2+)
       const inlineIntent = typeof req.body.intent === 'string' && req.body.intent.trim().length > 0
         ? req.body.intent.trim()
@@ -129,7 +141,8 @@ router.post('/start', upload.single('file'), async (req, res) => {
           // Contexte de reprise pour /diagnose/:jobId
           ctx: {
             mode, daw, title, artist, version,
-            durationSeconds, previousFiche,
+            durationSeconds, previousFiche, previousAnalysisResult,
+            locale,
             listening, pmContext, pmChunks, storagePromise,
           },
         });
@@ -139,7 +152,8 @@ router.post('/start', upload.single('file'), async (req, res) => {
       // ── PHASE B enchainee (skipIntent ou intention inline) ──
       await runDiagnosticPhase(jobId, {
         mode, daw, title, artist, version,
-        durationSeconds, previousFiche,
+        durationSeconds, previousFiche, previousAnalysisResult,
+        locale,
         listening, pmContext, pmChunks,
         storagePromise,
         intent: inlineIntent, // null si skip
@@ -191,7 +205,8 @@ router.post('/diagnose/:jobId', express.json(), (req, res) => {
 async function runDiagnosticPhase(jobId, ctx) {
   const {
     mode, daw, title, artist,
-    durationSeconds, previousFiche,
+    durationSeconds, previousFiche, previousAnalysisResult,
+    locale,
     listening, pmContext, pmChunks,
     storagePromise,
     intent,
@@ -207,6 +222,32 @@ async function runDiagnosticPhase(jobId, ctx) {
     console.error('[analyze] claude error:', err.message);
   }
 
+  // ── STAGE 4 (optionnel): Claude evolution (suivi inter-versions) ──
+  // Ne se declenche que si on a une analyse precedente complete (fiche +
+  // listening) ET une nouvelle fiche/listening. Sinon : pas d evolution,
+  // pipeline strictement identique a avant.
+  let evolution = null;
+  const canCompare =
+    fiche && listening &&
+    previousAnalysisResult &&
+    previousAnalysisResult.fiche &&
+    previousAnalysisResult.listening;
+  if (canCompare) {
+    try {
+      evolution = await generateEvolution(
+        { fiche: previousAnalysisResult.fiche, listening: previousAnalysisResult.listening },
+        { fiche, listening },
+        intent || previousAnalysisResult.intent_used || null,
+        locale || 'fr',
+      );
+      if (evolution) console.log('[analyze] evolution done — dominante:', evolution.dominante);
+      else console.log('[analyze] evolution skipped (null result)');
+    } catch (err) {
+      console.error('[analyze] evolution error:', err.message);
+      evolution = null;
+    }
+  }
+
   // Attend la fin du transcodage/upload (peut avoir fini depuis longtemps)
   const storagePath = storagePromise ? await storagePromise : null;
 
@@ -217,6 +258,7 @@ async function runDiagnosticPhase(jobId, ctx) {
     progress: 'Terminé', pct: 100,
     fiche: fiche || null,
     listening: listening || null,
+    evolution: evolution || null,
     storagePath: storagePath || null,
     intent_used: intent || null, // utile pour le front
     pmSources: (pmChunks || []).map(c => ({
