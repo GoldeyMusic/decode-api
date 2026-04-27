@@ -5,11 +5,16 @@ const { analyzeListening } = require('../lib/gemini');
 const { retrievePureMixContext, formatContextForPrompt } = require('../lib/rag');
 const { transcodeAndUpload } = require('../lib/audio-storage');
 const { analyzeFile: fadrAnalyzeFile, extractFadrData } = require('../lib/fadr');
+const { measureMaster: dspMeasureMaster } = require('../lib/dsp');
 
 // Timeout dur cote pipeline pour ne pas bloquer la fiche si Fadr est lent ou KO.
 // L analyse Fadr (upload + asset + stem polling) prend typiquement 30-90s ; au-dela
 // on se passe des mesures pour ne pas degrader l UX. Mode degrade = fadrMetrics=null.
 const FADR_TIMEOUT_MS = 90_000;
+// DSP maison (ffmpeg ebur128) — beaucoup plus rapide que Fadr (10-20s pour
+// un titre de 4 min). On garde une marge confortable au cas ou un fichier
+// long ou un container exotique demande plus de temps.
+const DSP_TIMEOUT_MS = 60_000;
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
@@ -76,7 +81,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
         console.log(`[analyze] ${req.file.originalname} (${Math.round(req.file.size / 1024)}KB)`);
       }
 
-      // ── STAGE PARALLELE: Fadr (BPM, tonalite, LUFS, stems) ──
+      // ── STAGE PARALLELE: Fadr (BPM, tonalite, stems) ──
       // Lance des reception du fichier en parallele de Gemini, du RAG et de la formulation
       // perception. On l attend juste avant generateFiche (avec timeout pour ne pas
       // bloquer la fiche si Fadr est lent). Erreurs et timeout = mode degrade (null).
@@ -92,6 +97,19 @@ router.post('/start', upload.single('file'), async (req, res) => {
           })
           .catch((err) => {
             console.error(`[analyze] fadr error after ${((Date.now() - t0) / 1000).toFixed(1)}s:`, err.message);
+            return null;
+          });
+      }
+
+      // ── STAGE PARALLELE: DSP maison (LUFS, LRA, True peak) ──
+      // Phase 2 du DSP_PLAN. Tournant via ffmpeg ebur128 (ITU-R BS.1770).
+      // Beaucoup plus rapide que Fadr (10-20s typique) et sans cout API.
+      // Mode degrade : null si ffmpeg KO ou timeout.
+      let dspPromise = null;
+      if (fileBuffer) {
+        dspPromise = dspMeasureMaster(fileBuffer)
+          .catch((err) => {
+            console.error('[analyze] dsp measureMaster error:', err.message);
             return null;
           });
       }
@@ -181,7 +199,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
             mode, daw, title, artist, version,
             durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
             locale,
-            listening, pmContext, pmChunks, storagePromise, fadrPromise,
+            listening, pmContext, pmChunks, storagePromise, fadrPromise, dspPromise,
           },
         });
         return; // on ATTEND un POST /diagnose/:jobId pour reprendre
@@ -193,7 +211,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
         durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
         locale,
         listening, pmContext, pmChunks,
-        storagePromise, fadrPromise,
+        storagePromise, fadrPromise, dspPromise,
         intent: inlineIntent, // null si skip
       });
     } catch (err) {
@@ -246,36 +264,55 @@ async function runDiagnosticPhase(jobId, ctx) {
     durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
     locale,
     listening, pmContext, pmChunks,
-    storagePromise, fadrPromise,
+    storagePromise, fadrPromise, dspPromise,
     intent,
   } = ctx;
 
-  // ── ATTENTE Fadr (avec timeout dur) ──
-  // En conditions normales fadrPromise a fini pendant Gemini + RAG + perception.
-  // Si Fadr est lent ou KO, on continue sans (mode degrade = fadrMetrics null).
-  // clearTimeout apres resolution evite un faux log "fadr timeout" qui apparaissait
-  // apres une analyse ou Fadr avait deja repondu en moins de 90s.
-  let fadrMetrics = null;
-  if (fadrPromise) {
+  // ── ATTENTE Fadr + DSP en parallele (avec timeouts independants) ──
+  // Les deux promesses sont independantes : Fadr (cloud, lent) et DSP maison
+  // (ffmpeg local, rapide). On les attend en parallele pour ne pas serialiser.
+  // Mode degrade : null si timeout/erreur, le pipeline continue.
+  const awaitWithTimeout = (promise, ms, label) => {
+    if (!promise) return Promise.resolve(null);
     let timeoutId = null;
     const timeoutPromise = new Promise((resolve) => {
       timeoutId = setTimeout(() => {
-        console.warn(`[analyze] fadr timeout ${FADR_TIMEOUT_MS / 1000}s — pipeline continues without metrics`);
+        console.warn(`[analyze] ${label} timeout ${ms / 1000}s — pipeline continues without`);
         resolve(null);
-      }, FADR_TIMEOUT_MS);
+      }, ms);
     });
-    fadrMetrics = await Promise.race([fadrPromise, timeoutPromise]);
-    if (timeoutId) clearTimeout(timeoutId);
-    if (fadrMetrics) {
-      const cur = jobs.get(jobId) || {};
-      jobs.set(jobId, { ...cur, stage: 'fadr_done', progress: 'Mesures objectives prêtes', pct: Math.max(cur.pct || 0, 75) });
-    }
+    return Promise.race([promise, timeoutPromise]).then((v) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      return v;
+    });
+  };
+
+  const [fadrMetrics, dspMetrics] = await Promise.all([
+    awaitWithTimeout(fadrPromise, FADR_TIMEOUT_MS, 'fadr'),
+    awaitWithTimeout(dspPromise, DSP_TIMEOUT_MS, 'dsp'),
+  ]);
+
+  if (fadrMetrics || dspMetrics) {
+    const cur = jobs.get(jobId) || {};
+    jobs.set(jobId, { ...cur, stage: 'measures_done', progress: 'Mesures objectives prêtes', pct: Math.max(cur.pct || 0, 75) });
   }
 
-  // ── STAGE 3: Claude fiche (listening + pmContext + intent + fadrMetrics) ──
+  // ── STAGE 3: Claude fiche (listening + pmContext + intent + fadr + dsp) ──
+  // On fusionne fadr (BPM, tonalite, stems) et dsp (LUFS, LRA, true peak)
+  // dans un objet "metrics" passe a Claude. Le LUFS DSP a la priorite sur
+  // le LUFS Fadr (qui est souvent null de toute facon).
+  const mergedMetrics = (fadrMetrics || dspMetrics) ? {
+    ...(fadrMetrics || {}),
+    ...(dspMetrics ? {
+      lufs: dspMetrics.lufs ?? (fadrMetrics?.lufs ?? null),
+      lra: dspMetrics.lra ?? null,
+      truePeak: dspMetrics.truePeak ?? null,
+    } : {}),
+  } : null;
+
   let fiche = null;
   try {
-    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletions || null, fadrMetrics);
+    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletions || null, mergedMetrics);
     if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
     console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
   } catch (err) {
@@ -321,7 +358,8 @@ async function runDiagnosticPhase(jobId, ctx) {
     evolution: evolution || null,
     storagePath: storagePath || null,
     intent_used: intent || null, // utile pour le front
-    fadrMetrics: fadrMetrics || null, // mesures objectives (BPM, tonalite, LUFS, stems) — null si Fadr KO/timeout
+    fadrMetrics: fadrMetrics || null, // BPM, tonalite, stems — null si Fadr KO
+    dspMetrics: dspMetrics || null,   // LUFS, LRA, truePeak — null si ffmpeg KO
     pmSources: (pmChunks || []).map(c => ({
       source_file: c.source_file,
       category: c.category,
