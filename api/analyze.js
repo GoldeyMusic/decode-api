@@ -253,15 +253,19 @@ async function runDiagnosticPhase(jobId, ctx) {
   // ── ATTENTE Fadr (avec timeout dur) ──
   // En conditions normales fadrPromise a fini pendant Gemini + RAG + perception.
   // Si Fadr est lent ou KO, on continue sans (mode degrade = fadrMetrics null).
+  // clearTimeout apres resolution evite un faux log "fadr timeout" qui apparaissait
+  // apres une analyse ou Fadr avait deja repondu en moins de 90s.
   let fadrMetrics = null;
   if (fadrPromise) {
-    fadrMetrics = await Promise.race([
-      fadrPromise,
-      new Promise((resolve) => setTimeout(() => {
+    let timeoutId = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
         console.warn(`[analyze] fadr timeout ${FADR_TIMEOUT_MS / 1000}s — pipeline continues without metrics`);
         resolve(null);
-      }, FADR_TIMEOUT_MS)),
-    ]);
+      }, FADR_TIMEOUT_MS);
+    });
+    fadrMetrics = await Promise.race([fadrPromise, timeoutPromise]);
+    if (timeoutId) clearTimeout(timeoutId);
     if (fadrMetrics) {
       const cur = jobs.get(jobId) || {};
       jobs.set(jobId, { ...cur, stage: 'fadr_done', progress: 'Mesures objectives prêtes', pct: Math.max(cur.pct || 0, 75) });
