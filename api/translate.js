@@ -126,14 +126,16 @@ ${JSON.stringify(content, null, 2)}`;
     // largement la limite pour éviter les troncatures qui cassent le JSON.
     // Modèle Haiku : 3-4× plus rapide que Sonnet, largement suffisant pour
     // de la traduction avec contraintes structurelles.
+    // 16000 tokens : confortable pour les fiches complètes les plus volumineuses
+    // (8000 trop juste, observé en prod sur le titre "lacher prise" V5).
     const raw = await chat([{ role: 'user', content: userMsg }], system, {
-      maxTokens: 8000,
+      maxTokens: 16000,
       model: 'claude-haiku-4-5-20251001',
     });
 
     let parsed;
     try {
-      const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+      let cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
       // Certains retours peuvent être encadrés de texte — on extrait le premier objet JSON complet
       const start = cleaned.indexOf('{');
       if (start === -1) throw new Error('Aucun JSON dans la réponse');
@@ -147,8 +149,38 @@ ${JSON.stringify(content, null, 2)}`;
         if (ch === '{') depth++;
         if (ch === '}') { depth--; if (depth === 0) { end = i; break; } }
       }
-      if (end === -1) throw new Error('JSON tronqué');
-      parsed = JSON.parse(cleaned.slice(start, end + 1));
+
+      let jsonText;
+      if (end === -1) {
+        // Repair JSON tronqué (meme logique que claude.js generateFiche).
+        // On ferme les paires ouvertes et on coupe la derniere paire incomplete.
+        // Mode degrade : la fiche traduite peut perdre 1-2 items en queue, mais
+        // le client s'en sort avec ce qu'on lui rend (mieux que 500).
+        console.warn('[translate] JSON truncated, attempting repair...');
+        let repair = cleaned.slice(start);
+        repair = repair.replace(/,\s*"[^"]*":\s*"[^"]*$/, '');
+        repair = repair.replace(/,\s*"[^"]*$/, '');
+        const openBraces = (repair.match(/\{/g) || []).length - (repair.match(/\}/g) || []).length;
+        const openBrackets = (repair.match(/\[/g) || []).length - (repair.match(/\]/g) || []).length;
+        for (let i = 0; i < openBrackets; i++) repair += ']';
+        for (let i = 0; i < openBraces; i++) repair += '}';
+        jsonText = repair;
+      } else {
+        jsonText = cleaned.slice(start, end + 1);
+      }
+
+      // Pre-repair des glitches de generation Claude observes sur claude.js
+      // ("score">N au lieu de "score":N). Aligne le comportement entre les
+      // deux endpoints.
+      const repaired = jsonText
+        .replace(/("\w+")\s*>\s*(-?\d)/g, '$1:$2')
+        .replace(/("\w+")\s*=\s*(-?\d)/g, '$1:$2');
+      if (repaired !== jsonText) {
+        console.warn('[translate] applied JSON glitch repair (operator-instead-of-colon)');
+        jsonText = repaired;
+      }
+
+      parsed = JSON.parse(jsonText);
     } catch (e) {
       console.error('[translate] parse error:', e.message);
       return res.status(500).json({ error: 'format invalide', raw: raw?.slice(0, 500) });
