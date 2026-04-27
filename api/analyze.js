@@ -43,6 +43,31 @@ router.post('/start', upload.single('file'), async (req, res) => {
           ? JSON.parse(req.body.previousAnalysisResult)
           : null;
       } catch {}
+      // Ticket 4.2 — items coches comme "implementes" sur V_(n-1) (array d ids).
+      // Resolu en contenu via previousAnalysisResult.fiche pour que generateFiche
+      // puisse les exposer dans son prompt et que applyAdviceCheck puisse matcher.
+      let previousCompletedIds = [];
+      try {
+        const raw = req.body.previousCompletions ? JSON.parse(req.body.previousCompletions) : [];
+        if (Array.isArray(raw)) previousCompletedIds = raw.filter(x => typeof x === 'string');
+      } catch {}
+      const previousCompletedItems = (() => {
+        if (!previousCompletedIds.length || !previousAnalysisResult?.fiche?.elements) return [];
+        const out = [];
+        for (const el of previousAnalysisResult.fiche.elements) {
+          for (const it of (el.items || [])) {
+            if (it && it.id && previousCompletedIds.includes(it.id)) {
+              out.push({
+                id: it.id,
+                cat: el.cat || '',
+                title: it.title || '',
+                score: typeof it.score === 'number' ? it.score : null,
+              });
+            }
+          }
+        }
+        return out;
+      })();
       const locale = typeof req.body.locale === 'string' && req.body.locale.trim().length > 0
         ? req.body.locale.trim()
         : 'fr';
@@ -142,6 +167,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
           ctx: {
             mode, daw, title, artist, version,
             durationSeconds, previousFiche, previousAnalysisResult,
+            previousCompletedItems,
             locale,
             listening, pmContext, pmChunks, storagePromise,
           },
@@ -153,6 +179,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
       await runDiagnosticPhase(jobId, {
         mode, daw, title, artist, version,
         durationSeconds, previousFiche, previousAnalysisResult,
+        previousCompletedItems,
         locale,
         listening, pmContext, pmChunks,
         storagePromise,
@@ -206,16 +233,17 @@ async function runDiagnosticPhase(jobId, ctx) {
   const {
     mode, daw, title, artist,
     durationSeconds, previousFiche, previousAnalysisResult,
+    previousCompletedItems,
     locale,
     listening, pmContext, pmChunks,
     storagePromise,
     intent,
   } = ctx;
 
-  // ── STAGE 3: Claude fiche (listening + pmContext + intent) ──
+  // ── STAGE 3: Claude fiche (listening + pmContext + intent + completedItems) ──
   let fiche = null;
   try {
-    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null);
+    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletedItems || []);
     if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
     console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
   } catch (err) {
