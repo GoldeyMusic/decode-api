@@ -4,6 +4,12 @@ const { generateFiche, formulatePerception, generateEvolution } = require('../li
 const { analyzeListening } = require('../lib/gemini');
 const { retrievePureMixContext, formatContextForPrompt } = require('../lib/rag');
 const { transcodeAndUpload } = require('../lib/audio-storage');
+const { analyzeFile: fadrAnalyzeFile, extractFadrData } = require('../lib/fadr');
+
+// Timeout dur cote pipeline pour ne pas bloquer la fiche si Fadr est lent ou KO.
+// L analyse Fadr (upload + asset + stem polling) prend typiquement 30-90s ; au-dela
+// on se passe des mesures pour ne pas degrader l UX. Mode degrade = fadrMetrics=null.
+const FADR_TIMEOUT_MS = 90_000;
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
@@ -62,11 +68,32 @@ router.post('/start', upload.single('file'), async (req, res) => {
         ? req.body.intent.trim()
         : null;
 
-      let fileBuffer = null, fileMime = null;
+      let fileBuffer = null, fileMime = null, fileName = null;
       if (req.file) {
         fileBuffer = req.file.buffer;
         fileMime = req.file.mimetype || 'audio/mpeg';
+        fileName = req.file.originalname || 'audio.mp3';
         console.log(`[analyze] ${req.file.originalname} (${Math.round(req.file.size / 1024)}KB)`);
+      }
+
+      // ── STAGE PARALLELE: Fadr (BPM, tonalite, LUFS, stems) ──
+      // Lance des reception du fichier en parallele de Gemini, du RAG et de la formulation
+      // perception. On l attend juste avant generateFiche (avec timeout pour ne pas
+      // bloquer la fiche si Fadr est lent). Erreurs et timeout = mode degrade (null).
+      let fadrPromise = null;
+      if (fileBuffer) {
+        const ext = (fileName.split('.').pop() || 'mp3').toLowerCase();
+        const t0 = Date.now();
+        fadrPromise = fadrAnalyzeFile(fileBuffer, fileName, ext, fileMime)
+          .then((task) => {
+            const data = extractFadrData(task);
+            console.log(`[analyze] fadr done in ${((Date.now() - t0) / 1000).toFixed(1)}s — bpm:${data.bpm} key:${data.key} lufs:${data.lufs} stems:${(data.stems || []).length}`);
+            return data;
+          })
+          .catch((err) => {
+            console.error(`[analyze] fadr error after ${((Date.now() - t0) / 1000).toFixed(1)}s:`, err.message);
+            return null;
+          });
       }
 
       const meta = { title, artist, daw, mode, version };
@@ -154,7 +181,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
             mode, daw, title, artist, version,
             durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
             locale,
-            listening, pmContext, pmChunks, storagePromise,
+            listening, pmContext, pmChunks, storagePromise, fadrPromise,
           },
         });
         return; // on ATTEND un POST /diagnose/:jobId pour reprendre
@@ -166,7 +193,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
         durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
         locale,
         listening, pmContext, pmChunks,
-        storagePromise,
+        storagePromise, fadrPromise,
         intent: inlineIntent, // null si skip
       });
     } catch (err) {
@@ -219,14 +246,32 @@ async function runDiagnosticPhase(jobId, ctx) {
     durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
     locale,
     listening, pmContext, pmChunks,
-    storagePromise,
+    storagePromise, fadrPromise,
     intent,
   } = ctx;
 
-  // ── STAGE 3: Claude fiche (listening + pmContext + intent) ──
+  // ── ATTENTE Fadr (avec timeout dur) ──
+  // En conditions normales fadrPromise a fini pendant Gemini + RAG + perception.
+  // Si Fadr est lent ou KO, on continue sans (mode degrade = fadrMetrics null).
+  let fadrMetrics = null;
+  if (fadrPromise) {
+    fadrMetrics = await Promise.race([
+      fadrPromise,
+      new Promise((resolve) => setTimeout(() => {
+        console.warn(`[analyze] fadr timeout ${FADR_TIMEOUT_MS / 1000}s — pipeline continues without metrics`);
+        resolve(null);
+      }, FADR_TIMEOUT_MS)),
+    ]);
+    if (fadrMetrics) {
+      const cur = jobs.get(jobId) || {};
+      jobs.set(jobId, { ...cur, stage: 'fadr_done', progress: 'Mesures objectives prêtes', pct: Math.max(cur.pct || 0, 75) });
+    }
+  }
+
+  // ── STAGE 3: Claude fiche (listening + pmContext + intent + fadrMetrics) ──
   let fiche = null;
   try {
-    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletions || null);
+    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletions || null, fadrMetrics);
     if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
     console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
   } catch (err) {
@@ -272,6 +317,7 @@ async function runDiagnosticPhase(jobId, ctx) {
     evolution: evolution || null,
     storagePath: storagePath || null,
     intent_used: intent || null, // utile pour le front
+    fadrMetrics: fadrMetrics || null, // mesures objectives (BPM, tonalite, LUFS, stems) — null si Fadr KO/timeout
     pmSources: (pmChunks || []).map(c => ({
       source_file: c.source_file,
       category: c.category,
