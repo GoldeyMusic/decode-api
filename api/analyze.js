@@ -79,6 +79,12 @@ router.post('/start', upload.single('file'), async (req, res) => {
       const inlineIntent = typeof req.body.intent === 'string' && req.body.intent.trim().length > 0
         ? req.body.intent.trim()
         : null;
+      // Genre musical : declare par l artiste a l upload (texte libre court)
+      // ou flag "Choisir automatiquement" -> inference par Claude depuis l ecoute.
+      const declaredGenre = typeof req.body.declaredGenre === 'string' && req.body.declaredGenre.trim().length > 0
+        ? req.body.declaredGenre.trim().slice(0, 600)
+        : null;
+      const genreUnknown = req.body.genreUnknown === 'true' || req.body.genreUnknown === true;
 
       let fileBuffer = null, fileMime = null, fileName = null;
       if (req.file) {
@@ -265,6 +271,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
             locale,
             listening, pmContext, pmChunks, storagePromise, fadrPromise, dspPromise,
             stemsPromise, stereoPromise,
+            declaredGenre, genreUnknown,
           },
         });
         return; // on ATTEND un POST /diagnose/:jobId pour reprendre
@@ -278,6 +285,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
         listening, pmContext, pmChunks,
         storagePromise, fadrPromise, dspPromise, stemsPromise, stereoPromise,
         intent: inlineIntent, // null si skip
+        declaredGenre, genreUnknown,
       });
     } catch (err) {
       console.error('[analyze] error:', err.message);
@@ -331,6 +339,7 @@ async function runDiagnosticPhase(jobId, ctx) {
     listening, pmContext, pmChunks,
     storagePromise, fadrPromise, dspPromise, stemsPromise, stereoPromise,
     intent,
+    declaredGenre, genreUnknown,
   } = ctx;
 
   // ── ATTENTE Fadr + DSP en parallele (avec timeouts independants) ──
@@ -385,7 +394,7 @@ async function runDiagnosticPhase(jobId, ctx) {
 
   let fiche = null;
   try {
-    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletions || null, mergedMetrics);
+    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletions || null, mergedMetrics, declaredGenre || null, !!genreUnknown);
     if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
     console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
   } catch (err) {
