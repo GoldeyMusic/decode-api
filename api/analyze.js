@@ -1,11 +1,14 @@
 const express = require('express');
 const multer = require('multer');
-const { generateFiche, formulatePerception, generateEvolution } = require('../lib/claude');
-const { analyzeListening } = require('../lib/gemini');
+const claudeLib = require('../lib/claude');
+const { generateFiche, formulatePerception, generateEvolution } = claudeLib;
+const geminiLib = require('../lib/gemini');
+const { analyzeListening } = geminiLib;
 const { retrievePureMixContext, formatContextForPrompt } = require('../lib/rag');
 const { transcodeAndUpload } = require('../lib/audio-storage');
 const { analyzeFile: fadrAnalyzeFile, extractFadrData, downloadStems: fadrDownloadStems } = require('../lib/fadr');
 const { measureMaster: dspMeasureMaster, measureStem: dspMeasureStem, measureStereoField: dspMeasureStereoField } = require('../lib/dsp');
+const { logAnalysisCost } = require('../lib/costTracker');
 
 // Timeout dur cote pipeline pour ne pas bloquer la fiche si Fadr est lent ou KO.
 // L analyse Fadr (upload + asset + stem polling) prend typiquement 30-90s ; au-dela
@@ -40,6 +43,15 @@ router.post('/start', upload.single('file'), async (req, res) => {
   const jobId = makeJobId();
   jobs.set(jobId, { status: 'pending', progress: 'Démarrage…', pct: 0 });
   res.json({ jobId });
+
+  // Reset les accumulators de tokens AVANT le pipeline (cost tracking).
+  // Lus à la fin de runDiagnosticPhase via getUsage() pour insérer la
+  // ligne analysis_cost_logs (cf. lib/costTracker.js).
+  // Note : les accumulators sont module-scope, donc thread-safe seulement
+  // si une seule analyse tourne à la fois. Le runtime Vercel garantit
+  // ça (1 invocation = 1 process). À surveiller si on passe en worker pool.
+  claudeLib.resetUsage();
+  geminiLib.resetUsage();
 
   (async () => {
     try {
@@ -267,6 +279,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
           // Contexte de reprise pour /diagnose/:jobId
           ctx: {
             mode, daw, title, artist, version,
+            userId,
             durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
             locale,
             listening, pmContext, pmChunks, storagePromise, fadrPromise, dspPromise,
@@ -280,6 +293,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
       // ── PHASE B enchainee (skipIntent ou intention inline) ──
       await runDiagnosticPhase(jobId, {
         mode, daw, title, artist, version,
+        userId,
         durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
         locale,
         listening, pmContext, pmChunks,
@@ -334,6 +348,7 @@ router.post('/diagnose/:jobId', express.json(), (req, res) => {
 async function runDiagnosticPhase(jobId, ctx) {
   const {
     mode, daw, title, artist,
+    userId,
     durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
     locale,
     listening, pmContext, pmChunks,
@@ -453,6 +468,24 @@ async function runDiagnosticPhase(jobId, ctx) {
     ctx: undefined, // on purge pour eviter de garder le listening en memoire plus longtemps
   });
   console.log('[analyze] done');
+
+  // ── COST TRACKING (analysis_cost_logs) ──
+  // Insère la ligne de coût de cette analyse dans Supabase.
+  // Lit les accumulators de tokens captés pendant le pipeline (gemini + claude)
+  // et y ajoute les forfaits Fadr/infra (cf. lib/costTracker.js).
+  // Try/catch isolé : une erreur DB ne doit JAMAIS casser une analyse réussie.
+  try {
+    await logAnalysisCost({
+      userId: userId || null,
+      jobId,
+      audioDurationSec: durationSeconds || null,
+      geminiUsage: geminiLib.getUsage(),
+      claudeUsage: claudeLib.getUsage(),
+      fadrCalled: !!fadrMetrics,
+    });
+  } catch (err) {
+    console.error('[analyze] cost tracking error (non-fatal):', err.message);
+  }
 }
 
 router.get('/status/:jobId', (req, res) => {
