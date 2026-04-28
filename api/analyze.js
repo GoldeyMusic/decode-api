@@ -4,8 +4,8 @@ const { generateFiche, formulatePerception, generateEvolution } = require('../li
 const { analyzeListening } = require('../lib/gemini');
 const { retrievePureMixContext, formatContextForPrompt } = require('../lib/rag');
 const { transcodeAndUpload } = require('../lib/audio-storage');
-const { analyzeFile: fadrAnalyzeFile, extractFadrData } = require('../lib/fadr');
-const { measureMaster: dspMeasureMaster } = require('../lib/dsp');
+const { analyzeFile: fadrAnalyzeFile, extractFadrData, downloadStems: fadrDownloadStems } = require('../lib/fadr');
+const { measureMaster: dspMeasureMaster, measureStem: dspMeasureStem, measureStereoField: dspMeasureStereoField } = require('../lib/dsp');
 
 // Timeout dur cote pipeline pour ne pas bloquer la fiche si Fadr est lent ou KO.
 // L analyse Fadr (upload + asset + stem polling) prend typiquement 30-90s ; au-dela
@@ -15,6 +15,13 @@ const FADR_TIMEOUT_MS = 90_000;
 // un titre de 4 min). On garde une marge confortable au cas ou un fichier
 // long ou un container exotique demande plus de temps.
 const DSP_TIMEOUT_MS = 60_000;
+// Phase 3 (DSP_PLAN B.4) — mesures par stem (4 stems × ebur128 + 2 bandpass
+// + Mid/Side + mono compat sur master). Sequentielles sur la latence du
+// download Fadr (qui est deja inclus dans FADR_TIMEOUT_MS) puis ffmpeg
+// ~5-10s par stem en parallele. On laisse 90s totaux pour absorber le
+// download des 4 stems S3 et les 8-12 spawns ffmpeg simultanes.
+const STEMS_TIMEOUT_MS = 90_000;
+const STEREO_TIMEOUT_MS = 60_000;
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
@@ -114,6 +121,63 @@ router.post('/start', upload.single('file'), async (req, res) => {
           });
       }
 
+      // ── STAGE PARALLELE: STEMS (Phase 3 / DSP_PLAN B.4) ──
+      // Chaine apres Fadr (besoin de l'asset.stems pour les URLs signees).
+      // Telecharge les buffers en RAM, mesure chaque stem (LUFS + bandpass
+      // sibilantes/presence), puis jette les buffers. Mode degrade total :
+      // null si Fadr KO, ou tableau partiel si certains stems KO.
+      let stemsPromise = null;
+      if (fadrPromise) {
+        stemsPromise = fadrPromise.then(async (data) => {
+          if (!data?.stems?.length) return null;
+          // downloadStems accepte un faux asset { stems: [...] } puisqu'il
+          // ne lit que asset.stems. Evite de propager le `task` complet.
+          let downloaded = null;
+          try {
+            downloaded = await fadrDownloadStems({ stems: data.stems });
+          } catch (err) {
+            console.error('[analyze] stems download error:', err.message);
+            return null;
+          }
+          if (!downloaded || !downloaded.length) return null;
+          // Mesures paralleles, buffers jetes apres mesure.
+          const measured = await Promise.all(downloaded.map(async (s) => {
+            const m = await dspMeasureStem(s.buffer, s.stemType).catch((err) => {
+              console.warn(`[analyze] stem ${s.stemType} measure error:`, err.message);
+              return null;
+            });
+            return {
+              name: s.name,
+              stemType: s.stemType,
+              sizeBytes: s.sizeBytes,
+              ...(m || {}),
+            };
+          }));
+          // On garde tous les stems telecharges meme si la mesure a echoue
+          // (le front saura : sizeBytes != null + lufs == null = mesure ratee).
+          return measured;
+        }).catch((err) => {
+          console.error('[analyze] stems chain error:', err.message);
+          return null;
+        });
+      }
+
+      // ── STAGE PARALLELE: STEREO FIELD (Phase 3 / DSP_PLAN B.3) ──
+      // Mesure independante du Fadr — utilise le buffer master directement.
+      // On chaine sur dspPromise pour reutiliser le LUFS stereo deja mesure
+      // et eviter un troisieme spawn ebur128 redondant.
+      let stereoPromise = null;
+      if (fileBuffer) {
+        stereoPromise = (dspPromise || Promise.resolve(null))
+          .then((dspMaster) =>
+            dspMeasureStereoField(fileBuffer, dspMaster?.lufs ?? null)
+          )
+          .catch((err) => {
+            console.error('[analyze] stereo error:', err.message);
+            return null;
+          });
+      }
+
       const meta = { title, artist, daw, mode, version };
       jobs.set(jobId, {
         status: 'pending', stage: 'started',
@@ -200,6 +264,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
             durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
             locale,
             listening, pmContext, pmChunks, storagePromise, fadrPromise, dspPromise,
+            stemsPromise, stereoPromise,
           },
         });
         return; // on ATTEND un POST /diagnose/:jobId pour reprendre
@@ -211,7 +276,7 @@ router.post('/start', upload.single('file'), async (req, res) => {
         durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
         locale,
         listening, pmContext, pmChunks,
-        storagePromise, fadrPromise, dspPromise,
+        storagePromise, fadrPromise, dspPromise, stemsPromise, stereoPromise,
         intent: inlineIntent, // null si skip
       });
     } catch (err) {
@@ -264,7 +329,7 @@ async function runDiagnosticPhase(jobId, ctx) {
     durationSeconds, previousFiche, previousAnalysisResult, previousCompletions,
     locale,
     listening, pmContext, pmChunks,
-    storagePromise, fadrPromise, dspPromise,
+    storagePromise, fadrPromise, dspPromise, stemsPromise, stereoPromise,
     intent,
   } = ctx;
 
@@ -287,27 +352,35 @@ async function runDiagnosticPhase(jobId, ctx) {
     });
   };
 
-  const [fadrMetrics, dspMetrics] = await Promise.all([
+  const [fadrMetrics, dspMetrics, stemsMetrics, stereoMetrics] = await Promise.all([
     awaitWithTimeout(fadrPromise, FADR_TIMEOUT_MS, 'fadr'),
     awaitWithTimeout(dspPromise, DSP_TIMEOUT_MS, 'dsp'),
+    awaitWithTimeout(stemsPromise, STEMS_TIMEOUT_MS, 'stems'),
+    awaitWithTimeout(stereoPromise, STEREO_TIMEOUT_MS, 'stereo'),
   ]);
 
-  if (fadrMetrics || dspMetrics) {
+  if (fadrMetrics || dspMetrics || stemsMetrics || stereoMetrics) {
     const cur = jobs.get(jobId) || {};
     jobs.set(jobId, { ...cur, stage: 'measures_done', progress: 'Mesures objectives prêtes', pct: Math.max(cur.pct || 0, 75) });
   }
 
-  // ── STAGE 3: Claude fiche (listening + pmContext + intent + fadr + dsp) ──
-  // On fusionne fadr (BPM, tonalite, stems) et dsp (LUFS, LRA, true peak)
-  // dans un objet "metrics" passe a Claude. Le LUFS DSP a la priorite sur
-  // le LUFS Fadr (qui est souvent null de toute facon).
-  const mergedMetrics = (fadrMetrics || dspMetrics) ? {
+  // ── STAGE 3: Claude fiche (listening + pmContext + intent + mesures) ──
+  // On fusionne fadr (BPM, tonalite, stems list), dsp master (LUFS, LRA,
+  // truePeak), stems mesures (LUFS+bandes par stem) et stereo (corr, M/S,
+  // mono compat) dans un objet "metrics" passe a Claude. Le LUFS DSP a la
+  // priorite sur le LUFS Fadr (qui est souvent null de toute facon).
+  const hasAnyMeasure = !!(fadrMetrics || dspMetrics || stemsMetrics || stereoMetrics);
+  const mergedMetrics = hasAnyMeasure ? {
     ...(fadrMetrics || {}),
     ...(dspMetrics ? {
       lufs: dspMetrics.lufs ?? (fadrMetrics?.lufs ?? null),
       lra: dspMetrics.lra ?? null,
       truePeak: dspMetrics.truePeak ?? null,
     } : {}),
+    // Phase 3 (DSP_PLAN B.4) — ajout des mesures par stem et du champ stereo.
+    // Null si la mesure correspondante a echoue (mode degrade).
+    stemsMeasured: stemsMetrics || null, // [{stemType, lufs, truePeak, energyBand_5_8kHz, energyBand_1_3kHz, ...}]
+    stereo: stereoMetrics || null,        // {correlation, midSideRatio, balanceLR, monoCompat}
   } : null;
 
   let fiche = null;
@@ -360,6 +433,9 @@ async function runDiagnosticPhase(jobId, ctx) {
     intent_used: intent || null, // utile pour le front
     fadrMetrics: fadrMetrics || null, // BPM, tonalite, stems — null si Fadr KO
     dspMetrics: dspMetrics || null,   // LUFS, LRA, truePeak — null si ffmpeg KO
+    // Phase 3 (DSP_PLAN B.4) — mesures par stem et champ stereo.
+    stemsMetrics: stemsMetrics || null, // [{stemType, lufs, truePeak, energyBand_*, ...}] ou null
+    stereoMetrics: stereoMetrics || null, // {correlation, midSideRatio, balanceLR, monoCompat} ou null
     pmSources: (pmChunks || []).map(c => ({
       source_file: c.source_file,
       category: c.category,
