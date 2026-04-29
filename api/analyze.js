@@ -9,6 +9,12 @@ const { transcodeAndUpload } = require('../lib/audio-storage');
 const { analyzeFile: fadrAnalyzeFile, extractFadrData, downloadStems: fadrDownloadStems } = require('../lib/fadr');
 const { measureMaster: dspMeasureMaster, measureStem: dspMeasureStem, measureStereoField: dspMeasureStereoField } = require('../lib/dsp');
 const { logAnalysisCost } = require('../lib/costTracker');
+const { getBalance, applyCreditDelta } = require('../lib/credits');
+
+// Toggle global monétisation. Tant que MONETIZATION_ENABLED ≠ 'true' :
+// pas de check balance, pas de débit, pas de refund — tout passe.
+// Phase test : laisser à false. Quand Stripe est branché : true.
+const MONETIZATION_ENABLED = process.env.MONETIZATION_ENABLED === 'true';
 
 // Timeout dur cote pipeline pour ne pas bloquer la fiche si Fadr est lent ou KO.
 // L analyse Fadr (upload + asset + stem polling) prend typiquement 30-90s ; au-dela
@@ -30,6 +36,28 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200
 
 const jobs = new Map();
 function makeJobId() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+// Refund le crédit débité au start si le pipeline a planté. Idempotent :
+// flip le flag creditDebited à false dans le jobs Map pour ne pas double-refund.
+// No-op si MONETIZATION_ENABLED=false ou si le crédit n'a jamais été débité.
+async function refundCreditIfDebited(jobId, errorMessage) {
+  if (!MONETIZATION_ENABLED) return;
+  const j = jobs.get(jobId);
+  if (!j || !j.creditDebited || !j.userId) return;
+  try {
+    await applyCreditDelta({
+      userId: j.userId,
+      delta: +1,
+      reason: 'refund_failed',
+      jobId,
+      notes: `Pipeline failed: ${(errorMessage || '').slice(0, 200)}`,
+    });
+    jobs.set(jobId, { ...j, creditDebited: false });
+    console.log(`[analyze] refunded 1 credit to ${j.userId} (job ${jobId})`);
+  } catch (e) {
+    console.error('[analyze] refund failed:', e.message);
+  }
+}
 
 // Flow (pipeline en 2 phases) :
 //   Phase A  — Gemini (ecoute) -> RAG PureMix -> Claude.formulatePerception -> job passe en 'awaiting_intent'
@@ -62,9 +90,55 @@ router.post('/start', upload.single('file'), async (req, res) => {
     });
   }
 
+  // ── Garde-fou crédits (cap balance) ─────────────────────────────
+  // Phase test : MONETIZATION_ENABLED=false → on bypass entièrement.
+  // En prod : check balance > 0, sinon 402 + redirect /pricing front.
+  // L'analyse anonyme (pas de userId, ex. sample report) reste libre.
+  const userIdEarly = req.body.userId || null;
+  if (MONETIZATION_ENABLED && userIdEarly) {
+    let balance = null;
+    try {
+      balance = await getBalance(userIdEarly);
+    } catch (e) {
+      console.error('[analyze] balance check failed:', e.message);
+      return res.status(500).json({ error: 'balance_check_failed' });
+    }
+    if (balance == null || balance < 1) {
+      return res.status(402).json({
+        error: 'no_credits',
+        message: 'Aucun crédit disponible. Achète un pack ou un abonnement pour continuer.',
+        balance: balance || 0,
+        redirect: '/#/pricing',
+      });
+    }
+  }
+
   const jobId = makeJobId();
-  jobs.set(jobId, { status: 'pending', progress: 'Démarrage…', pct: 0 });
+  jobs.set(jobId, { status: 'pending', progress: 'Démarrage…', pct: 0, userId: userIdEarly, creditDebited: false });
   res.json({ jobId });
+
+  // ── Débit immédiat du crédit (au start de l'analyse) ────────────
+  // Pattern AubioMix : on débite tout de suite, on refund automatiquement
+  // si le pipeline plante. Visible dans la sidebar : balance baisse, puis
+  // remonte si erreur. Audit complet via credit_events.
+  if (MONETIZATION_ENABLED && userIdEarly) {
+    try {
+      await applyCreditDelta({
+        userId: userIdEarly,
+        delta: -1,
+        reason: 'debit_analysis',
+        jobId,
+        notes: `Analyse ${jobId}`,
+      });
+      const j = jobs.get(jobId) || {};
+      jobs.set(jobId, { ...j, creditDebited: true });
+    } catch (e) {
+      // Si le débit plante (ex. balance déjà 0 entre check et débit),
+      // on n'arrête pas l'analyse — c'est mieux pour l'UX que de laisser
+      // un job zombi. Loggué pour suivi.
+      console.error('[analyze] debit failed (continuing without debit):', e.message);
+    }
+  }
 
   // Reset les accumulators de tokens AVANT le pipeline (cost tracking).
   // Lus à la fin de runDiagnosticPhase via getUsage() pour insérer la
@@ -325,7 +399,9 @@ router.post('/start', upload.single('file'), async (req, res) => {
       });
     } catch (err) {
       console.error('[analyze] error:', err.message);
-      jobs.set(jobId, { status: 'error', error: err.message });
+      const prev = jobs.get(jobId) || {};
+      jobs.set(jobId, { ...prev, status: 'error', error: err.message });
+      await refundCreditIfDebited(jobId, err.message);
     }
   })();
 });
@@ -361,6 +437,7 @@ router.post('/diagnose/:jobId', express.json(), (req, res) => {
     } catch (err) {
       console.error('[diagnose] error:', err.message);
       jobs.set(jobId, { ...(jobs.get(jobId) || {}), status: 'error', error: err.message });
+      await refundCreditIfDebited(jobId, err.message);
     }
   })();
 });

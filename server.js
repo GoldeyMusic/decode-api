@@ -11,6 +11,11 @@ const multer = require('multer');
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors({ origin:'*', methods:['GET','POST','OPTIONS'], allowedHeaders:['Content-Type','Authorization'] }));
+// /api/billing/webhook a besoin du raw body (signature Stripe). Le router
+// billing.js attache express.raw() directement à la route /webhook, donc
+// on doit monter ce router AVANT express.json() global — sinon le body
+// est déjà parsé en JSON et la signature ne match plus.
+app.use('/api/billing', require('./api/billing'));
 app.use(express.json({ limit:'1mb' }));
 app.get('/', (req, res) => res.json({ status:'ok', service:'Decode API' }));
 app.use('/api/analyze', require('./api/analyze'));
