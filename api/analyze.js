@@ -39,7 +39,29 @@ function makeJobId() { return Math.random().toString(36).slice(2) + Date.now().t
 //
 // Retro-compat : POST /start avec body field `skipIntent=true` enchaine les 2 phases
 // comme avant (pratique pour tests curl ou pour le front tant qu il n expose pas l ecran intention).
+// Cap audio (sync avec front : src/components/AddModal.jsx).
+// 720s = 12 min : limite anti-DJ-set qui protège l'API Fadr/Gemini.
+// On valide AVANT de créer le job pour pouvoir renvoyer 413 au client.
+const MAX_AUDIO_DURATION_SEC = 720;
+
 router.post('/start', upload.single('file'), async (req, res) => {
+  // ── Garde-fou durée audio (cap 12 min) ────────────────────────
+  // Le front envoie déjà durationSeconds calculé via HTMLAudioElement.
+  // Ici on revalide pour bloquer un éventuel bypass (curl, script tiers).
+  // Si la durée n'est pas fournie OU est égale à 0, on laisse passer
+  // (cas legacy : analyses anciennes qui n'envoyaient pas le champ).
+  // TODO eventuel : probe ffprobe côté serveur pour ne plus dépendre du
+  // chiffre client — coût négligeable mais ajoute une dépendance.
+  const durationSecondsRaw = parseFloat(req.body.durationSeconds);
+  if (Number.isFinite(durationSecondsRaw) && durationSecondsRaw > MAX_AUDIO_DURATION_SEC) {
+    return res.status(413).json({
+      error: 'audio_too_long',
+      message: `Audio file exceeds ${MAX_AUDIO_DURATION_SEC} seconds (12 minutes).`,
+      maxSeconds: MAX_AUDIO_DURATION_SEC,
+      receivedSeconds: Math.round(durationSecondsRaw),
+    });
+  }
+
   const jobId = makeJobId();
   jobs.set(jobId, { status: 'pending', progress: 'Démarrage…', pct: 0 });
   res.json({ jobId });
