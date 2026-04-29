@@ -2,9 +2,12 @@
 /**
  * scripts/init_stripe_catalog.js
  *
- * Crée (ou met à jour) les 7 produits + prices Stripe pour Versions :
- *   - 5 packs one-shot (pack_1, pack_5, pack_10, pack_25, pack_50)
+ * Crée (ou met à jour) les 4 produits + prices Stripe pour Versions :
+ *   - 2 packs one-shot (pack_1, pack_5)
  *   - 2 abos mensuels (sub_indie, sub_pro)
+ *
+ * Catalogue révisé 2026-04-29 (Piste A) : pack_10 / pack_25 / pack_50 retirés.
+ * Pour archiver les anciens prices côté Stripe : `node scripts/archive_legacy_packs.js`.
  *
  * Idempotent : si un product existe déjà avec le même metadata.plan_key,
  * on l'utilise au lieu d'en créer un nouveau (évite les doublons en cas
@@ -30,9 +33,6 @@ const Stripe = require('stripe');
 const PACKS = [
   { key: 'pack_1',  name: 'Versions — 1 analyse',   price_eur: 4.99,   credits: 1 },
   { key: 'pack_5',  name: 'Versions — 5 analyses',  price_eur: 19.99,  credits: 5 },
-  { key: 'pack_10', name: 'Versions — 10 analyses', price_eur: 34.99,  credits: 10 },
-  { key: 'pack_25', name: 'Versions — 25 analyses', price_eur: 79.99,  credits: 25 },
-  { key: 'pack_50', name: 'Versions — 50 analyses', price_eur: 139.99, credits: 50 },
 ];
 const SUBSCRIPTIONS = [
   { key: 'sub_indie', name: 'Versions — Abo Indie', price_eur: 14.99, credits: 12 },
@@ -42,9 +42,6 @@ const SUBSCRIPTIONS = [
 const KEY_TO_ENV = {
   pack_1:    'VITE_STRIPE_PRICE_PACK_1',
   pack_5:    'VITE_STRIPE_PRICE_PACK_5',
-  pack_10:   'VITE_STRIPE_PRICE_PACK_10',
-  pack_25:   'VITE_STRIPE_PRICE_PACK_25',
-  pack_50:   'VITE_STRIPE_PRICE_PACK_50',
   sub_indie: 'VITE_STRIPE_PRICE_SUB_INDIE',
   sub_pro:   'VITE_STRIPE_PRICE_SUB_PRO',
 };

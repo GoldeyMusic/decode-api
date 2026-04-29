@@ -10,7 +10,7 @@ const { transcodeAndUpload } = require('../lib/audio-storage');
 const { analyzeFile: fadrAnalyzeFile, extractFadrData, downloadStems: fadrDownloadStems } = require('../lib/fadr');
 const { measureMaster: dspMeasureMaster, measureStem: dspMeasureStem, measureStereoField: dspMeasureStereoField } = require('../lib/dsp');
 const { logAnalysisCost } = require('../lib/costTracker');
-const { getBalance, applyCreditDelta } = require('../lib/credits');
+const { getBalance, applyCreditDelta, debitOrdered } = require('../lib/credits');
 
 // Toggle global monétisation. Tant que MONETIZATION_ENABLED ≠ 'true' :
 // pas de check balance, pas de débit, pas de refund — tout passe.
@@ -84,10 +84,14 @@ async function refundCreditIfDebited(jobId, errorMessage) {
   const j = jobs.get(jobId);
   if (!j || !j.creditDebited || !j.userId) return;
   try {
+    // Refund vers le bucket `pack` : pipeline raté, on rend le crédit "à vie"
+    // (un peu plus généreux qu'au prélèvement initial, mais simple à expliquer
+    // et le crédit n'est pas perdu si l'utilisateur résilie son abo plus tard).
     await applyCreditDelta({
       userId: j.userId,
       delta: +1,
       reason: 'refund_failed',
+      bucket: 'pack',
       jobId,
       notes: `Pipeline failed: ${(errorMessage || '').slice(0, 200)}`,
     });
@@ -135,18 +139,19 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
   // L'analyse anonyme (pas de userId, ex. sample report) reste libre.
   const userIdEarly = req.body.userId || null;
   if (MONETIZATION_ENABLED && userIdEarly) {
-    let balance = null;
+    let balanceInfo = null;
     try {
-      balance = await getBalance(userIdEarly);
+      balanceInfo = await getBalance(userIdEarly);
     } catch (e) {
       console.error('[analyze] balance check failed:', e.message);
       return res.status(500).json({ error: 'balance_check_failed' });
     }
-    if (balance == null || balance < 1) {
+    const total = balanceInfo?.balance ?? 0;
+    if (total < 1) {
       return res.status(402).json({
         error: 'no_credits',
         message: 'Aucun crédit disponible. Achète un pack ou un abonnement pour continuer.',
-        balance: balance || 0,
+        balance: total,
         redirect: '/#/pricing',
       });
     }
@@ -160,17 +165,22 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
   // Pattern AubioMix : on débite tout de suite, on refund automatiquement
   // si le pipeline plante. Visible dans la sidebar : balance baisse, puis
   // remonte si erreur. Audit complet via credit_events.
+  // Modèle Splice (révision 2026-04-29) : débit ordonné via debitOrdered —
+  // consomme subscription_balance D'ABORD, puis pack_balance.
   if (MONETIZATION_ENABLED && userIdEarly) {
     try {
-      await applyCreditDelta({
+      const result = await debitOrdered({
         userId: userIdEarly,
-        delta: -1,
-        reason: 'debit_analysis',
+        amount: 1,
         jobId,
         notes: `Analyse ${jobId}`,
       });
-      const j = jobs.get(jobId) || {};
-      jobs.set(jobId, { ...j, creditDebited: true });
+      if (result?.ok) {
+        const j = jobs.get(jobId) || {};
+        jobs.set(jobId, { ...j, creditDebited: true });
+      } else {
+        console.warn(`[analyze] debit refused (${result?.reason}) — continuing without debit (race entre check et débit)`);
+      }
     } catch (e) {
       // Si le débit plante (ex. balance déjà 0 entre check et débit),
       // on n'arrête pas l'analyse — c'est mieux pour l'UX que de laisser

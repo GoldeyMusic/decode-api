@@ -10,13 +10,16 @@
  *   - /checkout : Bearer JWT Supabase (vérifié via supabase.auth.getUser).
  *   - /webhook  : signature Stripe (header `stripe-signature`).
  *
- * Crédit appliqué :
+ * Crédit appliqué (modèle Splice, révision 2026-04-29) :
  *   - Pack one-shot   : event `checkout.session.completed` (mode=payment)
- *                       → +N crédits (N = price.metadata.credits)
+ *                       → +N crédits dans bucket `pack` (à vie)
  *   - Abo mensuel     : event `invoice.paid` (chaque mois)
- *                       → +N crédits (idem) + maj user_credits.monthly_grant
+ *                       → +N crédits dans bucket `sub` (cumulés tant qu'abo actif)
+ *                       + maj monthly_grant / renews_at
+ *                       Pas de reset au renouvellement.
  *   - Abo annulé      : event `customer.subscription.deleted`
- *                       → reset monthly_grant à 0 (les crédits restants restent)
+ *                       → purge subscription_balance (bucket sub à 0), pack_balance intact
+ *                       → reset monthly_grant à 0
  *
  * Tous les events sont aussi loggés dans `revenue_logs` pour le suivi business.
  */
@@ -24,7 +27,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { getStripe } = require('../lib/stripe');
-const { applyCreditDelta } = require('../lib/credits');
+const { applyCreditDelta, purgeSubscriptionBalance } = require('../lib/credits');
 
 const router = express.Router();
 
@@ -169,7 +172,8 @@ async function handleStripeEvent(event, stripe) {
     return;
   }
 
-  // Abo résilié : on remet monthly_grant à 0 (pas de débit, juste arrêt du flux mensuel)
+  // Abo résilié : on purge subscription_balance (modèle Splice).
+  // Les crédits issus de packs (pack_balance) sont conservés à vie.
   if (event.type === 'customer.subscription.deleted') {
     const sub = event.data.object;
     const userId = sub?.metadata?.user_id;
@@ -177,10 +181,18 @@ async function handleStripeEvent(event, stripe) {
       console.warn('[billing/webhook] subscription.deleted without metadata.user_id, skip');
       return;
     }
+    // 1. Purge bucket sub (RPC). Logge un credit_event 'subscription_reset' négatif.
+    const purged = await purgeSubscriptionBalance({
+      userId,
+      stripeEventId: event.id,
+      notes: `Résiliation abo ${sub?.metadata?.plan_key || ''} (sub ${sub.id})`,
+    });
+    // 2. Reset des méta abo sur user_credits.
     const sb = getSbServiceRole();
     await sb.from('user_credits')
       .update({ monthly_grant: 0, monthly_renews_at: null, stripe_subscription_id: null })
       .eq('user_id', userId);
+    // 3. Log revenue (montant 0 — aucun mouvement d'argent, juste un audit).
     await logRevenueEvent({
       sb,
       userId,
@@ -190,7 +202,7 @@ async function handleStripeEvent(event, stripe) {
       net_eur: 0,
       stripe_id: sub.id || null,
       stripe_event_id: event.id,
-      notes: 'subscription deleted',
+      notes: `subscription deleted (${purged} sub credits purged)`,
     });
     return;
   }
@@ -217,6 +229,7 @@ async function handlePackPurchase({ session, stripe, eventId }) {
     userId,
     delta: credits,
     reason: 'purchase_pack',
+    bucket: 'pack',
     stripeEventId: eventId,
     notes: `Pack ${planKey} - session ${session.id}`,
   });
@@ -283,50 +296,19 @@ async function handleSubscriptionInvoice({ invoice, stripe, eventId }) {
     throw new Error(`subscription has no credits metadata (planKey=${planKey})`);
   }
 
-  // RESET du grant mensuel : les crédits abo non utilisés ne se cumulent pas.
-  // Les crédits issus de packs (one-shot) survivent au reset car on ne les
-  // touche pas dans l'algo : on calcule "abo restant = balance - extra_credits"
-  // au moment du renouvellement, mais c'est complexe à tracer. Pour le MVP
-  // on adopte une logique simple : à chaque renouvellement, on AJOUTE le
-  // grant mensuel (les crédits abo non utilisés se cumulent). Ajustement
-  // possible en V2 (reset propre via column "subscription_credits" séparée).
-  // → décision 2026-04-29 avec David : "reset chaque mois (a)" pour abo,
-  //   on NE LAISSE PAS les crédits non utilisés se cumuler. Implémentation :
-  //   on log un event `subscription_reset` négatif si la prev period existait,
-  //   puis un event `subscription_grant` positif.
+  // Modèle Splice (révision 2026-04-29) : pas de reset au renouvellement.
+  // Les crédits abo se cumulent dans subscription_balance tant que l'abo
+  // est actif. La purge se fait UNIQUEMENT à la résiliation (event
+  // customer.subscription.deleted → purgeSubscriptionBalance).
+  // → on ajoute simplement la nouvelle enveloppe mensuelle dans bucket sub.
 
   const sb = getSbServiceRole();
 
-  // Récupère le grant précédent pour calculer le reset
-  const { data: existing } = await sb
-    .from('user_credits')
-    .select('monthly_grant, balance_remaining, monthly_renews_at')
-    .eq('user_id', userId)
-    .maybeSingle();
-  const prevGrant = Number(existing?.monthly_grant || 0);
-  const prevBalance = Number(existing?.balance_remaining || 0);
-
-  // Reset : on retire l'éventuel grant précédent du balance (ce qui ne consomme
-  // que ce qui restait du grant abo, pas les packs achetés).
-  // Limite : on ne descend jamais sous zéro.
-  if (prevGrant > 0) {
-    const resetDelta = -Math.min(prevGrant, prevBalance);
-    if (resetDelta < 0) {
-      await applyCreditDelta({
-        userId,
-        delta: resetDelta,
-        reason: 'subscription_reset',
-        stripeEventId: `${eventId}-reset`, // suffixe pour idempotence séparée
-        notes: 'Reset crédits abo non utilisés',
-      });
-    }
-  }
-
-  // Grant : on ajoute la nouvelle enveloppe mensuelle
   await applyCreditDelta({
     userId,
     delta: credits,
     reason: 'subscription_grant',
+    bucket: 'sub',
     stripeEventId: eventId,
     notes: `Abo ${planKey} - renew (invoice ${invoice.id})`,
   });
