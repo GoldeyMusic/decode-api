@@ -25,6 +25,8 @@ app.use('/api/listen', require('./api/_listen'));
 app.use('/api/compare', require('./api/_compare'));
 app.use('/api/translate', require('./api/_translate'));
 app.use('/api/audio', require('./api/_audio-signed-url'));
+// Upload direct navigateur → Supabase (bypass limite ~4,5 Mo Vercel body).
+app.use('/api/storage', require('./api/_storage'));
 
 // Sur Vercel, l'app n'est pas listen() — elle est invoquée comme une serverless
 // function via api/index.js qui réexporte cet app. Le binaire fait `node server.js`

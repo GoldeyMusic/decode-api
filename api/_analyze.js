@@ -1,5 +1,6 @@
 const express = require('express');
 const multer = require('multer');
+const { createClient } = require('@supabase/supabase-js');
 const claudeLib = require('../lib/claude');
 const { generateFiche, formulatePerception, generateEvolution } = claudeLib;
 const geminiLib = require('../lib/gemini');
@@ -33,6 +34,44 @@ const STEMS_TIMEOUT_MS = 90_000;
 const STEREO_TIMEOUT_MS = 60_000;
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+
+// Client Supabase service-role pour télécharger les fichiers uploadés
+// directement par le navigateur dans `tmp/{userId}/...` (path d'upload direct).
+// On bypass RLS volontairement : seul le backend orchestre l'analyse.
+const supabaseStorage = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false } }
+);
+
+// Mapping ext → mime-type pour reconstituer un objet `req.file`-like depuis
+// un téléchargement Supabase Storage. Reste minimal : on fallback `audio/mpeg`
+// pour tout ce qui sort de la liste, ce qui couvre 99 % des cas pratiques.
+function mimeFromExt(ext) {
+  const e = String(ext || '').toLowerCase();
+  if (e === 'wav') return 'audio/wav';
+  if (e === 'mp3') return 'audio/mpeg';
+  if (e === 'aac' || e === 'm4a') return 'audio/aac';
+  if (e === 'flac') return 'audio/flac';
+  if (e === 'ogg' || e === 'opus') return 'audio/ogg';
+  if (e === 'aiff' || e === 'aif') return 'audio/aiff';
+  return 'audio/mpeg';
+}
+
+// Middleware conditionnel : déclenche multer UNIQUEMENT si la requête est
+// multipart (content-type "multipart/form-data"). Si JSON (le nouveau path
+// upload direct), on laisse `express.json()` global avoir déjà rempli
+// `req.body` et on saute multer — `req.file` reste undefined, et la route
+// téléchargera le fichier depuis Supabase via `req.body.storagePath`.
+function multerIfMultipart(uploadMiddleware) {
+  return (req, res, next) => {
+    const ct = (req.headers['content-type'] || '').toLowerCase();
+    if (ct.startsWith('multipart/form-data')) {
+      return uploadMiddleware(req, res, next);
+    }
+    next();
+  };
+}
 
 const jobs = new Map();
 function makeJobId() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
@@ -72,7 +111,7 @@ async function refundCreditIfDebited(jobId, errorMessage) {
 // On valide AVANT de créer le job pour pouvoir renvoyer 413 au client.
 const MAX_AUDIO_DURATION_SEC = 720;
 
-router.post('/start', upload.single('file'), async (req, res) => {
+router.post('/start', multerIfMultipart(upload.single('file')), async (req, res) => {
   // ── Garde-fou durée audio (cap 12 min) ────────────────────────
   // Le front envoie déjà durationSeconds calculé via HTMLAudioElement.
   // Ici on revalide pour bloquer un éventuel bypass (curl, script tiers).
@@ -195,11 +234,44 @@ router.post('/start', upload.single('file'), async (req, res) => {
       const genreUnknown = req.body.genreUnknown === 'true' || req.body.genreUnknown === true;
 
       let fileBuffer = null, fileMime = null, fileName = null;
+      // Path historique : multipart upload via multer.
       if (req.file) {
         fileBuffer = req.file.buffer;
         fileMime = req.file.mimetype || 'audio/mpeg';
         fileName = req.file.originalname || 'audio.mp3';
-        console.log(`[analyze] ${req.file.originalname} (${Math.round(req.file.size / 1024)}KB)`);
+        console.log(`[analyze] ${req.file.originalname} (${Math.round(req.file.size / 1024)}KB) [multipart]`);
+      }
+      // Path nouveau : upload direct navigateur → Supabase. Le client a fait
+      // un PUT signé sur `tmp/{userId}/...` puis nous a envoyé un body JSON
+      // avec `storagePath`. On télécharge ici (service-role, bypass RLS).
+      // Permet d'envoyer des WAV de plusieurs dizaines de Mo sans se cogner
+      // à la limite ~4,5 Mo body de Vercel serverless.
+      else if (req.body.storagePath && typeof req.body.storagePath === 'string') {
+        const path = req.body.storagePath;
+        const t0 = Date.now();
+        const { data, error } = await supabaseStorage.storage
+          .from('audio')
+          .download(path);
+        if (error || !data) {
+          throw new Error(`Storage download failed: ${error?.message || 'no data'}`);
+        }
+        const ab = await data.arrayBuffer();
+        fileBuffer = Buffer.from(ab);
+        fileName = path.split('/').pop() || 'audio';
+        const ext = (fileName.includes('.') ? fileName.split('.').pop() : '').toLowerCase();
+        fileMime = mimeFromExt(ext);
+        console.log(`[analyze] ${fileName} (${Math.round(fileBuffer.length / 1024)}KB) [storage:${path}, ${((Date.now() - t0) / 1000).toFixed(1)}s]`);
+        // Cleanup best-effort du tmp/ : plus rien n'a besoin du fichier source
+        // une fois qu'il est en buffer mémoire. Si la suppression rate (ex.
+        // fichier déjà absent), on log mais on ne bloque pas l'analyse.
+        // Évite l'accumulation d'orphelins dans le bucket `audio/tmp/...`.
+        if (path.startsWith('tmp/')) {
+          supabaseStorage.storage.from('audio').remove([path])
+            .then(({ error: rmErr }) => {
+              if (rmErr) console.warn('[analyze] tmp cleanup failed:', rmErr.message);
+            })
+            .catch((e) => console.warn('[analyze] tmp cleanup threw:', e.message));
+        }
       }
 
       // ── STAGE PARALLELE: Fadr (BPM, tonalite, stems) ──

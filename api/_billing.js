@@ -221,22 +221,51 @@ async function handlePackPurchase({ session, stripe, eventId }) {
     notes: `Pack ${planKey} - session ${session.id}`,
   });
 
-  // Log revenue
+  // Log revenue : on récupère le VRAI net via balance_transaction.fee de Stripe
+  // (pas une approximation 1.5%+0.25). Frais réels selon provenance carte :
+  // EEE 1,5% + 0,25 €, UK 2,5%, hors-EU ~3,25% + frais devise.
   const sb = getSbServiceRole();
   const grossEur = (session.amount_total || 0) / 100;
-  // Net après frais Stripe : approx 1.5% + 0.25€ pour cartes EU.
-  // On affine plus tard via `balance_transaction` côté Stripe pour le vrai chiffre.
-  const netEurApprox = grossEur > 0 ? Math.round((grossEur - (grossEur * 0.015 + 0.25)) * 100) / 100 : 0;
+  const { netEur } = await fetchStripeNet({ stripe, paymentIntentId: session.payment_intent, grossEur });
   await logRevenueEvent({
     sb, userId,
     source: 'stripe',
     product: planKey,
     amount_eur: grossEur,
-    net_eur: netEurApprox,
+    net_eur: netEur,
     stripe_id: session.payment_intent || session.id || null,
     stripe_event_id: eventId,
     notes: `Pack ${planKey} (${credits} credits)`,
   });
+}
+
+// ─── Récupère le vrai montant net via balance_transaction.fee Stripe ────
+// Pour PaymentIntent (one-shot) : passer paymentIntentId.
+// Pour Invoice (abo)            : passer chargeId directement.
+// Fallback : si la BT n'est pas encore disponible, approximation EEE 1.5%+0.25€.
+async function fetchStripeNet({ stripe, paymentIntentId = null, chargeId = null, grossEur }) {
+  try {
+    let charge = null;
+    if (paymentIntentId) {
+      const pi = await stripe.paymentIntents.retrieve(paymentIntentId, {
+        expand: ['latest_charge.balance_transaction'],
+      });
+      charge = pi?.latest_charge;
+    } else if (chargeId) {
+      charge = await stripe.charges.retrieve(chargeId, { expand: ['balance_transaction'] });
+    }
+    const bt = charge?.balance_transaction;
+    if (bt && typeof bt.fee === 'number') {
+      const feeEur = bt.fee / 100;
+      const netEur = Math.round((grossEur - feeEur) * 100) / 100;
+      return { netEur, feeEur, source: 'stripe_balance_transaction' };
+    }
+  } catch (e) {
+    console.warn('[billing] fetchStripeNet failed, using approximation:', e.message);
+  }
+  // Fallback : approximation EEE
+  const netApprox = grossEur > 0 ? Math.round((grossEur - (grossEur * 0.015 + 0.25)) * 100) / 100 : 0;
+  return { netEur: netApprox, feeEur: grossEur - netApprox, source: 'approximation_eee' };
 }
 
 // ─── Abo : facture mensuelle → crédite + maj monthly_grant ────
@@ -313,15 +342,15 @@ async function handleSubscriptionInvoice({ invoice, stripe, eventId }) {
     })
     .eq('user_id', userId);
 
-  // Log revenue
+  // Log revenue : récupère le VRAI net via balance_transaction.fee Stripe.
   const grossEur = (invoice.amount_paid || 0) / 100;
-  const netEurApprox = grossEur > 0 ? Math.round((grossEur - (grossEur * 0.015 + 0.25)) * 100) / 100 : 0;
+  const { netEur } = await fetchStripeNet({ stripe, chargeId: invoice.charge, grossEur });
   await logRevenueEvent({
     sb, userId,
     source: 'stripe',
     product: planKey,
     amount_eur: grossEur,
-    net_eur: netEurApprox,
+    net_eur: netEur,
     stripe_id: invoice.id || null,
     stripe_event_id: eventId,
     notes: `Abo ${planKey} renewal (invoice ${invoice.id}, ${credits} credits)`,
