@@ -242,6 +242,15 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
         ? req.body.declaredGenre.trim().slice(0, 600)
         : null;
       const genreUnknown = req.body.genreUnknown === 'true' || req.body.genreUnknown === true;
+      // Mix / Master toggle (refonte 2026-04-30). Default 'mix' pour rester
+      // permissif si le front n'envoie rien (anciens clients, fallback). Seules
+      // les deux valeurs prévues sont acceptées — toute autre chaîne est
+      // ramenée à 'mix' silencieusement (validation côté DB via la migration
+      // 021 si on devait la persister, mais ici on l'utilise juste pour
+      // calibrer le prompt + la pondération).
+      const uploadType = (req.body.uploadType === 'master' || req.body.uploadType === 'mix')
+        ? req.body.uploadType
+        : 'mix';
 
       let fileBuffer = null, fileMime = null, fileName = null;
       // Path historique : multipart upload via multer.
@@ -463,6 +472,7 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
             listening, pmContext, pmChunks, storagePromise, fadrPromise, dspPromise,
             stemsPromise, stereoPromise,
             declaredGenre, genreUnknown,
+            uploadType,
           },
         });
         return; // on ATTEND un POST /diagnose/:jobId pour reprendre
@@ -478,6 +488,7 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
         storagePromise, fadrPromise, dspPromise, stemsPromise, stereoPromise,
         intent: inlineIntent, // null si skip
         declaredGenre, genreUnknown,
+        uploadType,
       });
     } catch (err) {
       console.error('[analyze] error:', err.message);
@@ -536,6 +547,7 @@ async function runDiagnosticPhase(jobId, ctx) {
     storagePromise, fadrPromise, dspPromise, stemsPromise, stereoPromise,
     intent,
     declaredGenre, genreUnknown,
+    uploadType,
   } = ctx;
 
   // ── ATTENTE Fadr + DSP en parallele (avec timeouts independants) ──
@@ -590,7 +602,7 @@ async function runDiagnosticPhase(jobId, ctx) {
 
   let fiche = null;
   try {
-    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletions || null, mergedMetrics, declaredGenre || null, !!genreUnknown);
+    fiche = await generateFiche(mode, daw, title || 'Titre inconnu', artist, listening, pmContext, previousFiche, intent || null, previousCompletions || null, mergedMetrics, declaredGenre || null, !!genreUnknown, uploadType || 'mix');
     if (fiche && durationSeconds) fiche.duration_seconds = durationSeconds;
     console.log('[analyze] claude done — keys:', Object.keys(fiche || {}).join(', '));
   } catch (err) {
