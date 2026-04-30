@@ -20,6 +20,7 @@ app.use(express.json({ limit:'1mb' }));
 app.get('/', (req, res) => res.json({ status:'ok', service:'Decode API' }));
 app.use('/api/analyze', require('./api/_analyze'));
 app.use('/api/chat', require('./api/_chat'));
+app.use('/api/mastering-charter', require('./api/_mastering_charter'));
 app.use('/api/ask', require('./api/_ask'));
 app.use('/api/listen', require('./api/_listen'));
 app.use('/api/compare', require('./api/_compare'));
