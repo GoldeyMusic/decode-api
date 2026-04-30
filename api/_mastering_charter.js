@@ -198,6 +198,17 @@ router.post('/', async (req, res) => {
       `--- CHARTE MASTERING DE RÉFÉRENCE (base de connaissances à adapter) ---`,
       reference,
       ``,
+      `--- RÈGLES TECHNIQUES NON-NÉGOCIABLES (à ne JAMAIS contredire) ---`,
+      `LUFS : c'est une échelle NÉGATIVE. Plus la valeur est PROCHE DE ZÉRO, PLUS LE TRACK EST FORT. Plus la valeur est négative (loin de zéro), plus le track est faible.`,
+      `• −8 LUFS est PLUS FORT que −14 LUFS. Un track à −11 LUFS est PLUS FORT que la cible streaming −14 LUFS.`,
+      `• Pour ALLER de −14 LUFS À −11 LUFS, il faut AJOUTER ~3 dB de gain (limiteur plus poussé, ou gain en amont).`,
+      `• Pour ALLER de −11 LUFS À −14 LUFS, il faut RETIRER ~3 dB de gain (limiteur moins poussé, gain en amont baissé). Le limiteur ne "fait pas plus de travail" pour descendre — au contraire, il en fait moins.`,
+      `• Si l'utilisateur est à −11 LUFS et la cible est −14 : il est DÉJÀ AU-DELÀ de la cible. Spotify normalisera à la baisse de ~3 dB en lecture. Tu peux soit livrer comme ça (Spotify gérera) soit re-masteriser à −14 pour livrer la dynamique propre. JAMAIS dire "il manque X dB pour atteindre la cible" si l'utilisateur est déjà plus fort que la cible.`,
+      `• Si l'utilisateur est à −18 LUFS et la cible est −14 : il faut AJOUTER ~4 dB de gain au mastering pour atteindre la cible.`,
+      `AVANT D'ÉCRIRE UNE PHRASE SUR UN DELTA LUFS : explicite mentalement le sens. "Track à X LUFS, cible Y LUFS. X plus proche de zéro que Y ? Alors track plus fort que cible → réduire gain. X plus loin de zéro que Y ? Alors track plus faible que cible → ajouter gain."`,
+      `dBTP (true peak) : aussi échelle négative. −1 dBTP est plus haut que −3 dBTP. Plus on est proche de 0, plus on risque de cliquer.`,
+      `Si tu n'es pas SÛR du sens d'un delta technique, ne donne pas de chiffre — formule en termes qualitatifs ("ton mix est dans la zone cible", "tu es au-dessus / en dessous de la norme").`,
+      ``,
       `--- INSTRUCTIONS DE RÉDACTION ---`,
       `1. Tu écris UN SEUL message structuré (~600-900 mots), pas une conversation. Format markdown léger autorisé : gras **, puces •, sauts de ligne — c'est le seul message qui aura ce format, les réponses suivantes seront en prose.`,
       `2. Commence par 2-3 phrases de LECTURE DU TRACK : pose la situation actuelle en t'appuyant sur les chiffres mesurés (LUFS si dispo, BPM, genre) et le verdict de sortie. Ex : "Sur ton track [titre], avec un genre [genre] à [BPM] BPM mesuré actuellement à [LUFS], le verdict de sortie te place [ready/almost/not-yet]..."`,
@@ -207,7 +218,8 @@ router.post('/', async (req, res) => {
       `6. Si le track est uploadé comme MIX (uploadType='mix'), oriente clairement vers le pré-mastering (chaîne master bus, headroom à viser, true peak du fichier livré au mastering). Si c'est un MASTER (uploadType='master'), audite directement le master livré.`,
       `7. Termine par UNE question contextuelle pour inviter à creuser : "Tu veux qu'on creuse [point spécifique pertinent au track] ?". Pas une formule générique.`,
       `8. Pas de salutation, pas de "voici tes recommandations", pas de simulation de relation humaine. Tu es un collègue ingé qui briefe sur le mastering de ce track précis.`,
-      `9. Si tu manques d'info (LUFS non mesuré, genre absent), dis-le simplement ("le LUFS n'est pas remonté ici, mais...") et reste utile.`
+      `9. Si tu manques d'info (LUFS non mesuré, genre absent), dis-le simplement ("le LUFS n'est pas remonté ici, mais...") et reste utile.`,
+      `10. AVANT DE PUBLIER : relis chaque phrase qui contient un chiffre LUFS ou dBTP. Vérifie le sens du delta (cf. RÈGLES TECHNIQUES NON-NÉGOCIABLES ci-dessus). Une erreur de polarité sur LUFS est un facteur d'invalidation totale de la charte — mieux vaut moins précis que faux.`
     );
 
     const system = localeInstruction + promptParts.join('\n');
