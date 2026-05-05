@@ -11,6 +11,10 @@ const { analyzeFile: fadrAnalyzeFile, extractFadrData, downloadStems: fadrDownlo
 const { measureMaster: dspMeasureMaster, measureStem: dspMeasureStem, measureStereoField: dspMeasureStereoField } = require('../lib/dsp');
 const { logAnalysisCost } = require('../lib/costTracker');
 const { getBalance, applyCreditDelta, debitOrdered } = require('../lib/credits');
+// Limiteur de requêtes ciblé : appliqué UNIQUEMENT sur les routes coûteuses
+// (/start, /diagnose). PAS sur /status/:jobId qui est pollé toutes les 3s
+// pendant toute la durée de l'analyse (sinon 429 dès le 11ᵉ poll).
+const { analyzeLimiter } = require('../lib/rateLimit');
 
 // Toggle global monétisation. Tant que MONETIZATION_ENABLED ≠ 'true' :
 // pas de check balance, pas de débit, pas de refund — tout passe.
@@ -120,7 +124,7 @@ async function refundCreditIfDebited(jobId, errorMessage) {
 // On valide AVANT de créer le job pour pouvoir renvoyer 413 au client.
 const MAX_AUDIO_DURATION_SEC = 720;
 
-router.post('/start', multerIfMultipart(upload.single('file')), async (req, res) => {
+router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), async (req, res) => {
   // ── Garde-fou durée audio (cap 12 min) ────────────────────────
   // Le front envoie déjà durationSeconds calculé via HTMLAudioElement.
   // Ici on revalide pour bloquer un éventuel bypass (curl, script tiers).
@@ -521,7 +525,7 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
 // ─── POST /diagnose/:jobId — reprend un job en 'awaiting_intent' et execute la Phase B ───
 // body: { intent: string|null }
 // Si intent est vide/null, on lance le diagnostic en lecture neutre (equivalent skip).
-router.post('/diagnose/:jobId', express.json(), (req, res) => {
+router.post('/diagnose/:jobId', analyzeLimiter, express.json(), (req, res) => {
   const jobId = req.params.jobId;
   const job = jobs.get(jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });

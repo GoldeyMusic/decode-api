@@ -10,9 +10,11 @@ const cors = require('cors');
 const { requireAuth } = require('./lib/auth');
 const {
   chatLimiter, askLimiter, translateLimiter, compareLimiter,
-  masteringCharterLimiter, analyzeLimiter, listenLimiter,
+  masteringCharterLimiter, listenLimiter,
   storageLimiter, audioLimiter,
 } = require('./lib/rateLimit');
+// analyzeLimiter est désormais appliqué directement dans _analyze.js sur
+// /start et /diagnose (cf. mount /api/analyze plus bas). Pas importé ici.
 const app = express();
 // Railway/Vercel : trust proxy pour que express-rate-limit voie la vraie IP
 // dans X-Forwarded-For (sinon tous les requests partagent la même IP edge
@@ -56,7 +58,12 @@ app.get('/', (req, res) => res.json({ status: 'ok', service: 'Versions API' }));
 // req.user.id et req.user.email. Les endpoints DOIVENT utiliser
 // req.user.id (jamais req.body.userId) pour identifier l'auteur.
 // Rate-limit appliqué après l'auth pour cibler par user.id.
-app.use('/api/analyze', requireAuth, analyzeLimiter, require('./api/_analyze'));
+// analyzeLimiter NE doit PAS être appliqué globalement sur /api/analyze :
+// il bloquerait le polling /status/:jobId (toutes les 3s pendant 2-3 min
+// = >10 req/h très vite → 429 + frontend coincé en boucle de polls vides).
+// Le limiteur est poussé dans _analyze.js, ciblé sur /start + /diagnose
+// uniquement (les routes coûteuses Gemini+Claude+Fadr).
+app.use('/api/analyze', requireAuth, require('./api/_analyze'));
 app.use('/api/chat', requireAuth, chatLimiter, require('./api/_chat'));
 app.use('/api/mastering-charter', requireAuth, masteringCharterLimiter, require('./api/_mastering_charter'));
 app.use('/api/ask', requireAuth, askLimiter, require('./api/_ask'));
