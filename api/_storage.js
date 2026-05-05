@@ -4,17 +4,13 @@
 // bypasser la limite ~4,5 Mo body de Vercel serverless sur /api/analyze/start.
 //
 // Flow côté client (cf. UPLOAD_DIRECT_PLAN.md) :
-//   1. POST /api/storage/sign-upload  { userId, ext } → { storagePath, uploadUrl, token }
+//   1. POST /api/storage/sign-upload  { ext } → { storagePath, uploadUrl, token }
 //   2. fetch(uploadUrl, { method: 'PUT', body: file }) directement vers Supabase
 //   3. POST /api/analyze/start  { storagePath, ...metadata }  (body JSON minuscule)
 //
-// Le path retourné est `tmp/{userId}/{timestamp}-{uuid}.{ext}`. Le préfixe
-// `tmp/` permet à la RLS Supabase de borner les écritures par utilisateur :
-//   bucket_id='audio' AND (storage.foldername(name))[1]='tmp'
-//   AND (storage.foldername(name))[2]=auth.uid()::text
-// Le backend utilise ensuite la SERVICE_ROLE_KEY pour télécharger le fichier
-// dans /api/analyze/start (RLS bypass autorisé) puis nettoyer le tmp/ après
-// transcodage final.
+// SÉCURITÉ : le userId est dérivé du JWT (requireAuth) — JAMAIS du body.
+// Sinon un attaquant peut polluer le tmp/ d'un autre utilisateur.
+// Le path retourné est `tmp/{req.user.id}/{timestamp}-{uuid}.{ext}`.
 
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
@@ -33,10 +29,10 @@ const supabase = createClient(
 const ALLOWED_EXTS = new Set(['wav', 'mp3', 'aac', 'm4a', 'flac', 'ogg', 'opus', 'aiff', 'aif']);
 
 router.post('/sign-upload', async (req, res) => {
-  const { userId, ext } = req.body || {};
-  if (!userId || typeof userId !== 'string') {
-    return res.status(400).json({ error: 'userId requis' });
-  }
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'unauthorized' });
+
+  const { ext } = req.body || {};
   // Sanitize : uniquement [a-z0-9], 1-5 chars, fallback 'wav'.
   let safeExt = String(ext || 'wav').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 5);
   if (!ALLOWED_EXTS.has(safeExt)) safeExt = 'wav';
@@ -50,7 +46,7 @@ router.post('/sign-upload', async (req, res) => {
 
     if (error) {
       console.error('[storage] sign-upload error:', error.message);
-      return res.status(500).json({ error: error.message });
+      return res.status(500).json({ error: 'sign_upload_failed' });
     }
 
     res.json({
@@ -60,7 +56,7 @@ router.post('/sign-upload', async (req, res) => {
     });
   } catch (err) {
     console.error('[storage] sign-upload threw:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 

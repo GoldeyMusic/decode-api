@@ -183,13 +183,14 @@ ${JSON.stringify(content, null, 2)}`;
       parsed = JSON.parse(jsonText);
     } catch (e) {
       console.error('[translate] parse error:', e.message);
-      return res.status(500).json({ error: 'format invalide', raw: raw?.slice(0, 500) });
+      // Pas de `raw` renvoyé en prod — fuite de prompt interne sinon.
+      return res.status(500).json({ error: 'format_invalid' });
     }
 
     return res.json({ translated: parsed });
   } catch (err) {
     console.error('[translate] error:', err.message);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 

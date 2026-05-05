@@ -33,7 +33,12 @@ const DSP_TIMEOUT_MS = 60_000;
 const STEMS_TIMEOUT_MS = 90_000;
 const STEREO_TIMEOUT_MS = 60_000;
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+// Cap upload 80 Mo : 12 min × WAV 16-bit 44.1 kHz mono ou 12 min de MP3/AAC
+// stéréo HQ. multer en memoryStorage → 200 Mo × N requêtes parallèles saturait
+// la RAM Railway. 80 Mo couvre largement le cap durée 12 min imposé par
+// MAX_AUDIO_DURATION_SEC. Le path "upload direct + storagePath" reste
+// disponible pour les WAV plus gros (passe par Supabase Storage).
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 80 * 1024 * 1024 } });
 
 // Client Supabase service-role pour télécharger les fichiers uploadés
 // directement par le navigateur dans `tmp/{userId}/...` (path d'upload direct).
@@ -136,8 +141,10 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
   // ── Garde-fou crédits (cap balance) ─────────────────────────────
   // Phase test : MONETIZATION_ENABLED=false → on bypass entièrement.
   // En prod : check balance > 0, sinon 402 + redirect /pricing front.
-  // L'analyse anonyme (pas de userId, ex. sample report) reste libre.
-  const userIdEarly = req.body.userId || null;
+  // SÉCURITÉ : le userId vient du JWT (requireAuth a posé req.user) —
+  // jamais du body, sinon n'importe qui pourrait débiter le compte
+  // d'un autre utilisateur en passant un userId arbitraire.
+  const userIdEarly = req.user?.id || null;
   if (MONETIZATION_ENABLED && userIdEarly) {
     let balanceInfo = null;
     try {
@@ -204,7 +211,8 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
       const title = req.body.title || (req.file ? req.file.originalname.replace(/\.[^/.]+$/, '') : '');
       const version = req.body.version || '';
       const artist = req.body.artist || '';
-      const userId = req.body.userId || null;
+      // userId DÉRIVÉ DU JWT — cf. note ci-dessus.
+      const userId = req.user?.id || null;
       const skipIntent = req.body.skipIntent === 'true' || req.body.skipIntent === true;
       const durationSeconds = parseFloat(req.body.durationSeconds) || null;
       let previousFiche = null;
@@ -267,6 +275,17 @@ router.post('/start', multerIfMultipart(upload.single('file')), async (req, res)
       // à la limite ~4,5 Mo body de Vercel serverless.
       else if (req.body.storagePath && typeof req.body.storagePath === 'string') {
         const path = req.body.storagePath;
+        // SÉCURITÉ : valider que le path appartient au user authentifié.
+        // Sans ce check, un attaquant peut soumettre `tmp/<victim_uuid>/...`
+        // et faire analyser l'audio d'un autre utilisateur sur SES crédits.
+        // Format attendu : `tmp/<uuid_user>/<timestamp>-<uuid>.<ext>`.
+        const SAFE_PATH = /^tmp\/[a-f0-9-]{36}\/[\w.-]+\.(wav|mp3|aac|m4a|flac|ogg|opus|aiff|aif)$/i;
+        if (!SAFE_PATH.test(path)) {
+          throw new Error('storagePath_invalid');
+        }
+        if (!path.startsWith(`tmp/${userId}/`)) {
+          throw new Error('storagePath_forbidden');
+        }
         const t0 = Date.now();
         const { data, error } = await supabaseStorage.storage
           .from('audio')

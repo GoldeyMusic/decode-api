@@ -233,7 +233,7 @@ router.post('/', async (req, res) => {
     return res.json({ reply });
   } catch (err) {
     console.error('[mastering-charter] error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 

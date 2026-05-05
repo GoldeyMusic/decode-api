@@ -26,8 +26,10 @@ router.post('/', async (req, res) => {
     const {
       messages, item, daw, fadrData, listening, fiche,
       title, artist, version,
-      userId = null, versionId = null,
+      versionId = null,
     } = req.body;
+    // SÉCURITÉ : userId vient du JWT (requireAuth), pas du body.
+    const userId = req.user?.id || null;
     if (!messages) return res.status(400).json({ error: 'messages required' });
 
     const locale = (req.body.locale || 'fr').toString().toLowerCase().slice(0, 2);
@@ -124,7 +126,7 @@ router.post('/', async (req, res) => {
       // Pas de caching ici (prompt trop court pour bénéficier du cache).
       const langDirective = isEn ? 'Respond in English' : 'Réponds en français';
       systemPayload = chatLocaleInstruction +
-        `Tu es l'assistant Decode, expert production musicale. DAW: ${daw || 'Logic Pro'}. ` +
+        `Tu es l'assistant Versions, expert production musicale. DAW: ${daw || 'Logic Pro'}. ` +
         `Élément: ${item?.label || ''}. ${item?.detail || ''} ` +
         `${fadrData ? `BPM: ${fadrData.bpm}, Tonalité: ${fadrData.key}` : ''} ` +
         `${langDirective}, paramètres précis, alternative gratuite pour chaque plugin.`;
@@ -147,7 +149,8 @@ router.post('/', async (req, res) => {
 
     return res.json({ reply: result.reply });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error('[chat] error:', err.message);
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 

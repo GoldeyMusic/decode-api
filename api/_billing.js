@@ -32,14 +32,22 @@ const { applyCreditDelta, purgeSubscriptionBalance } = require('../lib/credits')
 const router = express.Router();
 
 // ─── Health check ─────────────────────────────────────────────
+// Public, mais ne renvoie AUCUNE info sur les env vars configurées
+// (énumération de secrets côté attaquant : "stripe configuré ? webhook
+// configuré ?"). On renvoie juste {ok:true}. Si jamais on a besoin de
+// debug en prod, gater derrière un X-Admin-Token header.
 router.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    stripe: !!process.env.STRIPE_SECRET_KEY,
-    webhook: !!process.env.STRIPE_WEBHOOK_SECRET,
-    supabase: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
-  });
+  res.json({ ok: true });
 });
+
+// Whitelist des priceId Stripe acceptés au /checkout. Synchronisé avec la
+// page pricing (init_stripe_catalog.js produit cette liste). Sans ça, un
+// user peut soumettre un priceId arbitraire de son propre compte Stripe et
+// se faire crédité avec les credits.metadata d'un produit non listé.
+// La liste est passée par env var pour faciliter la rotation prod/test sans
+// redeploy : STRIPE_PRICE_WHITELIST="price_abc,price_def,..."
+const PRICE_WHITELIST = (process.env.STRIPE_PRICE_WHITELIST || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
 // ─── Auth helper : vérifie le JWT Supabase ────────────────────
 async function getAuthedUser(req) {
@@ -70,6 +78,12 @@ router.post('/checkout', express.json({ limit: '10kb' }), async (req, res) => {
     }
     if (!priceId || typeof priceId !== 'string' || !priceId.startsWith('price_')) {
       return res.status(400).json({ error: 'priceId required (price_...)' });
+    }
+    // Whitelist (si configurée). En dev/test, laisser PRICE_WHITELIST vide
+    // pour bypass — en prod, la variable est définie et bloque tout priceId
+    // non listé.
+    if (PRICE_WHITELIST.length > 0 && !PRICE_WHITELIST.includes(priceId)) {
+      return res.status(400).json({ error: 'priceId_not_allowed' });
     }
     const checkoutMode = mode === 'subscription' ? 'subscription' : 'payment';
 
@@ -110,7 +124,7 @@ router.post('/checkout', express.json({ limit: '10kb' }), async (req, res) => {
     return res.json({ url: session.url });
   } catch (err) {
     console.error('[billing/checkout] error:', err.message, err.stack);
-    return res.status(500).json({ error: 'checkout_failed', message: err.message });
+    return res.status(500).json({ error: 'checkout_failed' });
   }
 });
 
@@ -145,7 +159,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   } catch (err) {
     console.error('[billing/webhook] handler threw:', err.message, err.stack);
     // 500 → Stripe va retry. Idempotence garantie via stripe_event_id UNIQUE.
-    return res.status(500).json({ error: 'handler_failed', message: err.message });
+    return res.status(500).json({ error: 'handler_failed' });
   }
 });
 

@@ -10,6 +10,9 @@ router.post('/', async (req, res) => {
       ? `Music production expert. Clear answers, precise parameters, a free alternative for every paid plugin mentioned. Respond in English.`
       : `Expert production musicale. Réponses claires, paramètres précis, alternative gratuite. Réponds en français.`;
     return res.json({ reply: await chat(messages, system) });
-  } catch(err) { return res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error('[ask] error:', err.message);
+    return res.status(500).json({ error: 'internal_error' });
+  }
 });
 module.exports = router;

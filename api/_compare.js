@@ -74,12 +74,14 @@ router.post('/', async (req, res) => {
       const cleaned = raw.replace(/```json\s*|\s*```/g, '').trim();
       parsed = JSON.parse(cleaned);
     } catch (e) {
-      return res.status(500).json({ error: 'format invalide', raw });
+      console.error('[compare] parse error:', e.message);
+      return res.status(500).json({ error: 'format_invalid' });
     }
 
     return res.json(parsed);
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error('[compare] error:', err.message);
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 

@@ -101,10 +101,10 @@ const KEY_TO_ENV = {
   for (const line of envLines) console.log(line);
   console.log('\n=== Étapes restantes ===');
   console.log('1. Colle les VITE_STRIPE_PRICE_* dans versions-app/.env (et Vercel env vars).');
-  console.log('2. Crée le webhook Stripe (dashboard) → endpoint https://<decode-api>/api/billing/webhook');
+  console.log('2. Crée le webhook Stripe (dashboard) → endpoint https://<versions-api>/api/billing/webhook');
   console.log('   Events à écouter : checkout.session.completed, invoice.paid, customer.subscription.deleted');
-  console.log('3. Copie le Webhook signing secret (whsec_...) → STRIPE_WEBHOOK_SECRET sur decode-api.');
-  console.log('4. Set STRIPE_SECRET_KEY (sk_test_...) côté decode-api.');
+  console.log('3. Copie le Webhook signing secret (whsec_...) → STRIPE_WEBHOOK_SECRET sur versions-api.');
+  console.log('4. Set STRIPE_SECRET_KEY (sk_test_...) côté versions-api.');
   console.log('\nTerminé.\n');
 })().catch((err) => {
   console.error('FAILED:', err.message);
