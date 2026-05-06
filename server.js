@@ -53,6 +53,11 @@ app.use('/api/billing', require('./api/_billing'));
 app.use(express.json({ limit: '1mb' }));
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'Versions API' }));
 
+// ─── Endpoints internes (Supabase Database Webhooks) ──────────────
+// Pas de requireAuth — gated par le shared secret X-Notify-Secret côté router.
+// Appelés server-to-server par Supabase sur INSERT/DELETE de auth.users.
+app.use('/api/internal', require('./api/_internal'));
+
 // ─── Endpoints authentifiés ───────────────────────────────────────
 // Tous ces routers exigent un Bearer JWT Supabase. requireAuth pose
 // req.user.id et req.user.email. Les endpoints DOIVENT utiliser
