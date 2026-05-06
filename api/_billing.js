@@ -28,6 +28,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { getStripe } = require('../lib/stripe');
 const { applyCreditDelta, purgeSubscriptionBalance } = require('../lib/credits');
+const { notifyOps, renderOpsEmail, stripeUrl } = require('../lib/notifyOps');
 
 const router = express.Router();
 
@@ -218,6 +219,45 @@ async function handleStripeEvent(event, stripe) {
       stripe_event_id: event.id,
       notes: `subscription deleted (${purged} sub credits purged)`,
     });
+
+    // 4. Notif ops : récupère l'email client (sub.customer = ID string)
+    let customerEmail = '—';
+    if (sub.customer && typeof sub.customer === 'string') {
+      try {
+        const cust = await stripe.customers.retrieve(sub.customer);
+        customerEmail = cust?.email || '—';
+      } catch (e) {
+        console.warn('[notifyOps] retrieve customer failed for sub.deleted:', e.message);
+      }
+    }
+    const planKey = sub?.metadata?.plan_key || 'subscription';
+    const livemode = !!event.livemode;
+    await notifyOps({
+      subject: `[Versions] Abo résilié · ${planKey}`,
+      html: renderOpsEmail({
+        title: `Abonnement résilié · ${planKey}`,
+        intro: `${customerEmail} a résilié l'abonnement ${planKey}.`,
+        rows: [
+          { label: 'Client', value: customerEmail },
+          { label: 'Plan', value: planKey },
+          { label: 'Crédits abo purgés', value: purged > 0 ? `−${purged}` : '0 (aucun restant)' },
+          { label: 'User ID', value: userId },
+          { label: 'Subscription', value: sub.id, link: stripeUrl({ livemode, kind: 'subscriptions', id: sub.id }) },
+          { label: 'Customer', value: sub.customer, link: stripeUrl({ livemode, kind: 'customers', id: sub.customer }) },
+          { label: 'Mode', value: livemode ? 'live' : 'test' },
+        ],
+        footerLink: stripeUrl({ livemode, kind: 'subscriptions', id: sub.id }),
+      }),
+    });
+    return;
+  }
+
+  // Remboursement (partiel ou total). On NE touche PAS aux crédits ici
+  // (scope cadré 2026-05-04, à coder au 1er cas réel) — on envoie juste la
+  // notif ops pour que David soit prévenu et puisse ajuster manuellement
+  // le solde du user via Supabase si besoin.
+  if (event.type === 'charge.refunded') {
+    await notifyRefund({ event, stripe });
     return;
   }
 
@@ -263,6 +303,30 @@ async function handlePackPurchase({ session, stripe, eventId }) {
     stripe_id: session.payment_intent || session.id || null,
     stripe_event_id: eventId,
     notes: `Pack ${planKey} (${credits} credits)`,
+  });
+
+  // ─── Notif ops ────────────────────────────────────────────
+  const livemode = !!session.livemode;
+  const customerEmail = session.customer_details?.email || session.customer_email || '—';
+  const currency = (session.currency || 'eur').toUpperCase();
+  await notifyOps({
+    subject: `[Versions] Pack acheté · ${planKey} · ${grossEur.toFixed(2)} ${currency}`,
+    html: renderOpsEmail({
+      title: `Pack acheté · ${planKey}`,
+      intro: `${customerEmail} vient d'acheter le pack ${planKey}.`,
+      rows: [
+        { label: 'Client', value: customerEmail },
+        { label: 'Plan', value: planKey },
+        { label: 'Montant brut', value: `${grossEur.toFixed(2)} ${currency}` },
+        { label: 'Net (après frais Stripe)', value: `${netEur.toFixed(2)} ${currency}` },
+        { label: 'Crédits livrés', value: `+${credits}` },
+        { label: 'User ID', value: userId },
+        { label: 'Session', value: session.id, link: stripeUrl({ livemode, kind: 'payments', id: session.payment_intent }) },
+        { label: 'Mode', value: livemode ? 'live' : 'test' },
+        { label: 'Date', value: new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC' },
+      ],
+      footerLink: stripeUrl({ livemode, kind: 'payments', id: session.payment_intent }),
+    }),
   });
 }
 
@@ -351,6 +415,37 @@ async function handleSubscriptionInvoice({ invoice, stripe, eventId }) {
     stripe_event_id: eventId,
     notes: `Abo ${planKey} renewal (invoice ${invoice.id}, ${credits} credits)`,
   });
+
+  // ─── Notif ops ────────────────────────────────────────────
+  // billing_reason : 'subscription_create' (1ère facture) vs 'subscription_cycle' (renouvellement)
+  const isInitial = invoice.billing_reason === 'subscription_create';
+  const livemode = !!invoice.livemode;
+  const customerEmail = invoice.customer_email || '—';
+  const currency = (invoice.currency || 'eur').toUpperCase();
+  const label = isInitial ? 'Nouvel abonnement' : 'Renouvellement abo';
+  await notifyOps({
+    subject: `[Versions] ${label} · ${planKey} · ${grossEur.toFixed(2)} ${currency}`,
+    html: renderOpsEmail({
+      title: `${label} · ${planKey}`,
+      intro: isInitial
+        ? `${customerEmail} vient de souscrire à l'abonnement ${planKey}.`
+        : `Renouvellement automatique de l'abonnement ${planKey} pour ${customerEmail}.`,
+      rows: [
+        { label: 'Client', value: customerEmail },
+        { label: 'Plan', value: planKey },
+        { label: 'Type', value: isInitial ? 'Création' : 'Renouvellement' },
+        { label: 'Montant brut', value: `${grossEur.toFixed(2)} ${currency}` },
+        { label: 'Net (après frais Stripe)', value: `${netEur.toFixed(2)} ${currency}` },
+        { label: 'Crédits livrés', value: `+${credits}` },
+        { label: 'User ID', value: userId },
+        { label: 'Subscription', value: subscriptionId, link: stripeUrl({ livemode, kind: 'subscriptions', id: subscriptionId }) },
+        { label: 'Invoice', value: invoice.id, link: stripeUrl({ livemode, kind: 'invoices', id: invoice.id }) },
+        { label: 'Prochaine facture', value: renewsAt ? renewsAt.slice(0, 10) : '—' },
+        { label: 'Mode', value: livemode ? 'live' : 'test' },
+      ],
+      footerLink: stripeUrl({ livemode, kind: 'subscriptions', id: subscriptionId }),
+    }),
+  });
 }
 
 // ─── Logging revenue_logs ─────────────────────────────────────
@@ -379,6 +474,53 @@ async function logRevenueEvent({ sb, userId, source, product, amount_eur, net_eu
     description: notes || null,
   });
   if (error) console.error('[billing] revenue_logs insert failed:', error.message);
+}
+
+// ─── charge.refunded : notif uniquement (pas de purge crédit auto) ────
+// Le scope "auto-clean revenue_logs + crédits" a été cadré le 2026-05-04
+// mais reporté au 1er cas réel. Pour l'instant on prévient David par email
+// pour qu'il puisse ajuster manuellement via Supabase si besoin.
+async function notifyRefund({ event, stripe }) {
+  const charge = event.data.object;
+  const refundedEur = (charge.amount_refunded || 0) / 100;
+  const grossEur = (charge.amount || 0) / 100;
+  const currency = (charge.currency || 'eur').toUpperCase();
+  const isFullRefund = refundedEur >= grossEur;
+  const livemode = !!event.livemode;
+  const customerEmail = charge.billing_details?.email || charge.receipt_email || '—';
+
+  // Essaie de retrouver le user_id via la metadata du PaymentIntent
+  let userId = '—';
+  let planKey = '—';
+  if (charge.payment_intent && typeof charge.payment_intent === 'string') {
+    try {
+      const pi = await stripe.paymentIntents.retrieve(charge.payment_intent);
+      userId = pi?.metadata?.user_id || '—';
+      planKey = pi?.metadata?.plan_key || '—';
+    } catch (e) {
+      console.warn('[notifyOps] retrieve PI failed for refund:', e.message);
+    }
+  }
+
+  await notifyOps({
+    subject: `[Versions] Remboursement ${isFullRefund ? 'total' : 'partiel'} · ${refundedEur.toFixed(2)} ${currency}`,
+    html: renderOpsEmail({
+      title: `Remboursement ${isFullRefund ? 'total' : 'partiel'} · ${refundedEur.toFixed(2)} ${currency}`,
+      intro: `Un remboursement vient d'être traité par Stripe. Vérifie le solde crédits du user dans Supabase si besoin (pas de purge automatique).`,
+      rows: [
+        { label: 'Client', value: customerEmail },
+        { label: 'Plan d\'origine', value: planKey },
+        { label: 'Montant remboursé', value: `${refundedEur.toFixed(2)} ${currency}` },
+        { label: 'Charge initiale', value: `${grossEur.toFixed(2)} ${currency}` },
+        { label: 'Type', value: isFullRefund ? 'Total' : 'Partiel' },
+        { label: 'User ID', value: userId },
+        { label: 'Charge', value: charge.id, link: stripeUrl({ livemode, kind: 'payments', id: charge.payment_intent }) },
+        { label: 'Customer', value: charge.customer, link: stripeUrl({ livemode, kind: 'customers', id: charge.customer }) },
+        { label: 'Mode', value: livemode ? 'live' : 'test' },
+      ],
+      footerLink: stripeUrl({ livemode, kind: 'payments', id: charge.payment_intent }),
+    }),
+  });
 }
 
 let _sbServiceRole = null;
