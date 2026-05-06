@@ -260,8 +260,8 @@ router.post('/confirm-deletion', express.json({ limit: '4kb' }), async (req, res
           "Merci d'avoir essayé Versions. Si un jour tu changes d'avis, la porte reste ouverte — tu peux toujours créer un nouveau compte sur versions.studio.",
         ],
       ],
-      footerFr: "Si tu as supprimé ton compte par erreur, écris-nous à contact@versions.studio dans les prochaines heures — on peut peut-être restaurer une partie de tes données depuis nos sauvegardes.",
-      footerEn: "If you deleted your account by mistake, write to us at contact@versions.studio within the next few hours — we may be able to restore some of your data from our backups.",
+      footerFr: "Une question, un retour, ou juste envie de nous dire pourquoi tu pars ? Écris à contact@versions.studio, on lit tout.",
+      footerEn: "A question, feedback, or just want to tell us why you're leaving? Write to contact@versions.studio, we read everything.",
     });
     await sendUserEmail({
       to: payload.email,
