@@ -120,10 +120,10 @@ function renderUserEmail({ titleFr, titleEn, paras, cta, footerFr, footerEn, loc
   return `<!doctype html>
 <html lang="${isEn ? 'en' : 'fr'}">
 <head><meta charset="utf-8"><title>${escapeHtml(t)}</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#0e0d12;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#1a1820">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#0e0d12;padding:40px 16px">
+<body style="margin:0;padding:0;background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#1a1820">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;padding:40px 16px">
   <tr><td align="center">
-      <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;width:100%;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,0.4)">
+      <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;width:100%;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08),0 1px 0 rgba(0,0,0,0.04)">
         <tr>
           <td align="center" style="padding:40px 32px 24px;background:linear-gradient(180deg,#1a1820 0%,#0e0d12 100%)">
             <div style="font-size:32px;font-weight:800;letter-spacing:0.04em;color:#ff8a1f;margin-bottom:6px">VERSiONS</div>
