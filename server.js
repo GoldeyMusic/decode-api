@@ -58,6 +58,12 @@ app.get('/', (req, res) => res.json({ status: 'ok', service: 'Versions API' }));
 // Appelés server-to-server par Supabase sur INSERT/DELETE de auth.users.
 app.use('/api/internal', require('./api/_internal'));
 
+// ─── Endpoints user-facing pour la gestion du compte ──────────────
+// /request-deletion : Bearer JWT user → envoie mail de confirmation
+// /confirm-deletion : token signé en body → supprime le compte via Admin API
+// (cf. _account.js pour le détail du flow et de la sécurité).
+app.use('/api/account', require('./api/_account'));
+
 // ─── Endpoints authentifiés ───────────────────────────────────────
 // Tous ces routers exigent un Bearer JWT Supabase. requireAuth pose
 // req.user.id et req.user.email. Les endpoints DOIVENT utiliser
