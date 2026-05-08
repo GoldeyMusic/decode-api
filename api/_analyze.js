@@ -15,6 +15,10 @@ const { getBalance, applyCreditDelta, debitOrdered } = require('../lib/credits')
 // (/start, /diagnose). PAS sur /status/:jobId qui est pollé toutes les 3s
 // pendant toute la durée de l'analyse (sinon 429 dès le 11ᵉ poll).
 const { analyzeLimiter } = require('../lib/rateLimit');
+// Classifie les exceptions du pipeline en codes stables (analysis_failed,
+// analysis_timeout, analysis_service_unavailable…) pour ne plus laisser fuiter
+// l'`err.message` anglais brut vers le front via job.error.
+const { classifyJobError } = require('../lib/jobErrors');
 
 // Toggle global monétisation. Tant que MONETIZATION_ENABLED ≠ 'true' :
 // pas de check balance, pas de débit, pas de refund — tout passe.
@@ -516,7 +520,9 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
     } catch (err) {
       console.error('[analyze] error:', err.message);
       const prev = jobs.get(jobId) || {};
-      jobs.set(jobId, { ...prev, status: 'error', error: err.message });
+      // Code stable côté front (cf. lib/jobErrors). err.message reste en console
+      // pour le debug, mais n'est jamais exposé à l'utilisateur (anglais brut).
+      jobs.set(jobId, { ...prev, status: 'error', error: classifyJobError(err) });
       await refundCreditIfDebited(jobId, err.message);
     }
   })();
@@ -528,9 +534,9 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
 router.post('/diagnose/:jobId', analyzeLimiter, express.json(), (req, res) => {
   const jobId = req.params.jobId;
   const job = jobs.get(jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (!job) return res.status(404).json({ error: 'job_not_found' });
   if (job.status !== 'awaiting_intent' || !job.ctx) {
-    return res.status(409).json({ error: 'Job not in awaiting_intent state', status: job.status });
+    return res.status(409).json({ error: 'job_not_in_awaiting_intent', status: job.status });
   }
 
   const intent = typeof req.body?.intent === 'string' && req.body.intent.trim().length > 0
@@ -552,7 +558,7 @@ router.post('/diagnose/:jobId', analyzeLimiter, express.json(), (req, res) => {
       await runDiagnosticPhase(jobId, { ...job.ctx, intent });
     } catch (err) {
       console.error('[diagnose] error:', err.message);
-      jobs.set(jobId, { ...(jobs.get(jobId) || {}), status: 'error', error: err.message });
+      jobs.set(jobId, { ...(jobs.get(jobId) || {}), status: 'error', error: classifyJobError(err) });
       await refundCreditIfDebited(jobId, err.message);
     }
   })();
@@ -706,7 +712,7 @@ async function runDiagnosticPhase(jobId, ctx) {
 
 router.get('/status/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (!job) return res.status(404).json({ error: 'job_not_found' });
   // On ne renvoie PAS `ctx` au front (trop lourd, contient listening + pmContext).
   const { ctx, ...publicJob } = job;
   res.json(publicJob);
