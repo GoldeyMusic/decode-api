@@ -1,4 +1,5 @@
 const express = require('express');
+const multer = require('multer');
 console.log('[startup] env check:', {
   OPENAI_API_KEY: process.env.OPENAI_API_KEY ? 'present' : 'MISSING',
   SUPABASE_URL: process.env.SUPABASE_URL ? 'present' : 'MISSING',
@@ -84,6 +85,35 @@ app.use('/api/translate', requireAuth, translateLimiter, require('./api/_transla
 app.use('/api/audio', requireAuth, audioLimiter, require('./api/_audio-signed-url'));
 // Upload direct navigateur → Supabase (bypass limite ~4,5 Mo Vercel body).
 app.use('/api/storage', requireAuth, storageLimiter, require('./api/_storage'));
+
+// ─── Error handler ───────────────────────────────────────────────
+// DOIT être déclaré APRÈS tous les app.use de routes (Express n'invoque
+// les middlewares d'erreur que pour les routes montées avant). Sans ce
+// handler, une MulterError (fichier trop gros, multipart cassé) retombait
+// sur le handler par défaut → 500 brut, sans payload JSON. Du coup le
+// front affichait "Démarrage échoué (500)" alors qu'on a un message
+// "Fichier trop lourd" parfaitement adapté côté i18n.
+//
+// On ne crée PAS de message FR ici : tout est i18n côté front, on renvoie
+// juste un code stable + (optionnel) le seuil pour que le front mette en
+// forme un message localisé propre. Cf. _analyze.js qui renvoie déjà
+// `error: 'audio_too_long'` / `error: 'no_credits'` sur le même modèle.
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      // 80 Mo — cf. _analyze.js multer config (memoryStorage + limits.fileSize).
+      // Si on remonte ce plafond un jour, on n'a qu'à changer la constante
+      // multer là-bas, le client reçoit le bon chiffre via maxBytes.
+      return res.status(413).json({
+        error: 'file_too_large',
+        maxBytes: 80 * 1024 * 1024,
+      });
+    }
+    return res.status(400).json({ error: 'upload_failed', code: err.code });
+  }
+  console.error('[express] unhandled error:', err);
+  return res.status(500).json({ error: 'internal_error' });
+});
 
 // Sur Vercel, l'app n'est pas listen() — elle est invoquée comme une serverless
 // function via api/index.js qui réexporte cet app. Le binaire fait `node server.js`
