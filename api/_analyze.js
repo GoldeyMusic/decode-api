@@ -412,14 +412,18 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
         });
         // Cache hit = pas d appel modele = on rembourse le credit qui a ete
         // debite en amont (line ~185). Sinon l'utilisateur paie pour zero appel.
+        // Note: on reutilise le reason 'refund_failed' valide par le CHECK
+        // constraint de credit_events (migration 016). Pas de reason
+        // dedie pour cache hit a ce jour — on disambigue via le champ notes.
         const jForRefund = jobs.get(jobId) || {};
         if (MONETIZATION_ENABLED && jForRefund.creditDebited && jForRefund.userId) {
           try {
             await applyCreditDelta({
               userId: jForRefund.userId,
               delta: 1,
-              reason: 'refund:cache_hit',
-              metadata: { jobId },
+              reason: 'refund_failed',
+              jobId,
+              notes: 'cache_hit',
             });
             jobs.set(jobId, { ...jForRefund, creditDebited: false });
             console.log(`[analyze] refunded 1 credit to ${jForRefund.userId} (cache hit)`);
@@ -610,6 +614,7 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
             stemsPromise, stereoPromise,
             declaredGenre, genreUnknown,
             uploadType,
+            userBpm, // override Fadr si saisi par l artiste
             cacheAudioHash, cacheParamsSig, // cache fiche (migration 031)
           },
         });
@@ -625,6 +630,7 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
         listening, pmContext, pmChunks,
         storagePromise, fadrPromise, dspPromise, stemsPromise, stereoPromise,
         cacheAudioHash, cacheParamsSig, // cache fiche (migration 031)
+        userBpm, // override Fadr si saisi par l artiste
         intent: inlineIntent, // null si skip
         declaredGenre, genreUnknown,
         uploadType,
@@ -689,6 +695,7 @@ async function runDiagnosticPhase(jobId, ctx) {
     intent,
     declaredGenre, genreUnknown,
     uploadType,
+    userBpm, // override Fadr si saisi par l artiste
     cacheAudioHash, cacheParamsSig, // cache fiche (migration 031)
   } = ctx;
 
