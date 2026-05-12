@@ -273,6 +273,16 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
       const uploadType = (req.body.uploadType === 'master' || req.body.uploadType === 'mix')
         ? req.body.uploadType
         : 'mix';
+      // BPM optionnel saisi par l'artiste. Override Fadr post-analyse si
+      // present. Validation : nombre dans [30, 300]. Hors borne ou
+      // non-numerique = ignore (Fadr garde la main).
+      const userBpmRaw = req.body.userBpm;
+      const userBpm = (() => {
+        if (userBpmRaw == null || userBpmRaw === '') return null;
+        const n = parseFloat(String(userBpmRaw).trim().replace(',', '.'));
+        if (!Number.isFinite(n) || n < 30 || n > 300) return null;
+        return n;
+      })();
 
       let fileBuffer = null, fileMime = null, fileName = null;
       // Path historique : multipart upload via multer.
@@ -343,6 +353,7 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
           intent: inlineIntent,
           declaredGenre,
           uploadType,
+          userBpm,
         });
         cachedAnalysis = await lookupAnalysisCache(cacheAudioHash, cacheParamsSig);
         if (cachedAnalysis) {
@@ -706,6 +717,15 @@ async function runDiagnosticPhase(jobId, ctx) {
     awaitWithTimeout(stemsPromise, STEMS_TIMEOUT_MS, 'stems'),
     awaitWithTimeout(stereoPromise, STEREO_TIMEOUT_MS, 'stereo'),
   ]);
+
+  // User BPM override : l artiste a renseigne le BPM dans la modale.
+  // Prime sur la detection Fadr (qui se trompe souvent entre half-time
+  // et double-time, 75 vs 150 etc.). Mutate fadrMetrics si dispo pour
+  // que l override soit visible dans toutes les utilisations downstream.
+  if (userBpm != null && fadrMetrics) {
+    console.log(`[analyze] user BPM override : ${fadrMetrics.bpm} -> ${userBpm}`);
+    fadrMetrics.bpm = userBpm;
+  }
 
   if (fadrMetrics || dspMetrics || stemsMetrics || stereoMetrics) {
     const cur = jobs.get(jobId) || {};
