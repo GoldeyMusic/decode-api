@@ -365,7 +365,23 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
           progress: 'Récupération de l\'analyse…', pct: 50,
           meta: { title, artist, daw, mode, version },
         });
+        // Lissage de la barre pendant le transcoding+upload (~10-15s).
+        // Sans ce ticker, la barre reste figee a 50 % puis saute a 100 %,
+        // ce qui donne l impression que le job freeze. On monte de 50 a 90
+        // par paliers de +2 % toutes les 700 ms (cap a 90 pour garder de
+        // la marge — le 100 % vient quand storage_path est dispo).
+        let lissagePct = 50;
+        const lissageTicker = setInterval(() => {
+          lissagePct = Math.min(lissagePct + 2, 90);
+          const cur = jobs.get(jobId);
+          if (!cur || cur.status !== 'pending') {
+            clearInterval(lissageTicker);
+            return;
+          }
+          jobs.set(jobId, { ...cur, pct: lissagePct });
+        }, 700);
         const storagePathFast = await storagePromiseFast;
+        clearInterval(lissageTicker);
         const curFast = jobs.get(jobId) || {};
         jobs.set(jobId, {
           ...curFast,
