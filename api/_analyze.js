@@ -421,7 +421,7 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
       let listening = null;
       if (fileBuffer) {
         try {
-          listening = await analyzeListening(fileBuffer, fileMime, title || '', artist || '', mode);
+          listening = await analyzeListening(fileBuffer, fileMime, title || '', artist || '', mode, undefined, undefined, { userId });
           console.log('[analyze] listening done');
         } catch (err) {
           console.error('[analyze] listening error:', err.message);
