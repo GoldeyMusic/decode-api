@@ -734,6 +734,16 @@ async function runDiagnosticPhase(jobId, ctx) {
     fadrMetrics.bpm = userBpm;
   }
 
+  // Arrondi BPM a 0.5 pres. Fadr renvoie souvent 3-4 decimales (ex: 79.213)
+  // qui n ont aucune valeur perceptive et polluent l affichage et les
+  // recettes. Helper : nombre le plus proche d un multiple de 0.5.
+  if (fadrMetrics && typeof fadrMetrics.bpm !== 'undefined' && fadrMetrics.bpm != null) {
+    const rawBpm = typeof fadrMetrics.bpm === 'string' ? parseFloat(fadrMetrics.bpm) : fadrMetrics.bpm;
+    if (Number.isFinite(rawBpm)) {
+      fadrMetrics.bpm = Math.round(rawBpm * 2) / 2;
+    }
+  }
+
   if (fadrMetrics || dspMetrics || stemsMetrics || stereoMetrics) {
     const cur = jobs.get(jobId) || {};
     jobs.set(jobId, { ...cur, stage: 'measures_done', progress: 'Mesures objectives prêtes', pct: Math.max(cur.pct || 0, 75) });
