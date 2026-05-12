@@ -10,6 +10,12 @@ const { transcodeAndUpload } = require('../lib/audio-storage');
 const { analyzeFile: fadrAnalyzeFile, extractFadrData, downloadStems: fadrDownloadStems } = require('../lib/fadr');
 const { measureMaster: dspMeasureMaster, measureStem: dspMeasureStem, measureStereoField: dspMeasureStereoField } = require('../lib/dsp');
 const { logAnalysisCost } = require('../lib/costTracker');
+const {
+  computeAudioHash,
+  computeParamsSignature,
+  lookupAnalysisCache,
+  saveAnalysisCache,
+} = require('../lib/analysis-cache');
 const { getBalance, applyCreditDelta, debitOrdered } = require('../lib/credits');
 // Limiteur de requêtes ciblé : appliqué UNIQUEMENT sur les routes coûteuses
 // (/start, /diagnose). PAS sur /status/:jobId qui est pollé toutes les 3s
@@ -320,6 +326,83 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
         }
       }
 
+      // ── CACHE FICHE COMPLET (migration 031) ──────────────────────────
+      // Lookup tres tot : si on a deja analyse ce fichier avec les memes
+      // parametres (intent, genre declare, type d'upload), on sert la fiche
+      // mise en cache et on saute tout le pipeline lourd (Gemini, Fadr,
+      // DSP, stems, stereo, Claude). On laisse tourner uniquement le
+      // transcoding/upload Storage en parallele (necessaire pour avoir un
+      // storage_path frais pour ce upload-ci, que le BottomPlayer puisse
+      // jouer le morceau).
+      let cachedAnalysis = null;
+      let cacheAudioHash = null;
+      let cacheParamsSig = null;
+      if (fileBuffer) {
+        cacheAudioHash = computeAudioHash(fileBuffer);
+        cacheParamsSig = computeParamsSignature({
+          intent: inlineIntent,
+          declaredGenre,
+          uploadType,
+        });
+        cachedAnalysis = await lookupAnalysisCache(cacheAudioHash, cacheParamsSig);
+        if (cachedAnalysis) {
+          console.log(`[analyze] cache hit on audio_hash ${cacheAudioHash.slice(0, 12)}… — skipping pipeline`);
+        }
+      }
+
+      // Branche cache hit : transcode + upload pour le storage_path, puis
+      // populate le job final avec le cached_result. On ne touche pas a
+      // l evolution ni a previousAnalysisResult — si fournis, on continue
+      // sans evolution (le delta version-a-version recalcule sur demande).
+      if (cachedAnalysis) {
+        const storagePromiseFast = transcodeAndUpload({ fileBuffer, fileMime, userId })
+          .catch((err) => {
+            console.error('[analyze] storage transcode error (cache hit branch):', err.message);
+            return null;
+          });
+        jobs.set(jobId, {
+          status: 'pending', stage: 'started',
+          progress: 'Récupération de l\'analyse…', pct: 50,
+          meta: { title, artist, daw, mode, version },
+        });
+        const storagePathFast = await storagePromiseFast;
+        const curFast = jobs.get(jobId) || {};
+        jobs.set(jobId, {
+          ...curFast,
+          status: 'complete', stage: 'all_done',
+          progress: 'Terminé', pct: 100,
+          fiche: cachedAnalysis.fiche || null,
+          listening: cachedAnalysis.listening || null,
+          fadrMetrics: cachedAnalysis.fadrMetrics || null,
+          dspMetrics: cachedAnalysis.dspMetrics || null,
+          stemsMetrics: cachedAnalysis.stemsMetrics || null,
+          stereoMetrics: cachedAnalysis.stereoMetrics || null,
+          evolution: null,
+          storagePath: storagePathFast || null,
+          intent_used: inlineIntent || null,
+          pmSources: [],
+          audioHash: cacheAudioHash,
+        });
+        // Cache hit = pas d appel modele = on rembourse le credit qui a ete
+        // debite en amont (line ~185). Sinon l'utilisateur paie pour zero appel.
+        const jForRefund = jobs.get(jobId) || {};
+        if (MONETIZATION_ENABLED && jForRefund.creditDebited && jForRefund.userId) {
+          try {
+            await applyCreditDelta({
+              userId: jForRefund.userId,
+              delta: 1,
+              reason: 'refund:cache_hit',
+              metadata: { jobId },
+            });
+            jobs.set(jobId, { ...jForRefund, creditDebited: false });
+            console.log(`[analyze] refunded 1 credit to ${jForRefund.userId} (cache hit)`);
+          } catch (refundErr) {
+            console.warn('[analyze] cache hit refund failed:', refundErr.message);
+          }
+        }
+        return; // skip tout le pipeline
+      }
+
       // ── STAGE PARALLELE: Fadr (BPM, tonalite, stems) ──
       // Lance des reception du fichier en parallele de Gemini, du RAG et de la formulation
       // perception. On l attend juste avant generateFiche (avec timeout pour ne pas
@@ -500,6 +583,7 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
             stemsPromise, stereoPromise,
             declaredGenre, genreUnknown,
             uploadType,
+            cacheAudioHash, cacheParamsSig, // cache fiche (migration 031)
           },
         });
         return; // on ATTEND un POST /diagnose/:jobId pour reprendre
@@ -513,6 +597,7 @@ router.post('/start', analyzeLimiter, multerIfMultipart(upload.single('file')), 
         locale,
         listening, pmContext, pmChunks,
         storagePromise, fadrPromise, dspPromise, stemsPromise, stereoPromise,
+        cacheAudioHash, cacheParamsSig, // cache fiche (migration 031)
         intent: inlineIntent, // null si skip
         declaredGenre, genreUnknown,
         uploadType,
@@ -577,6 +662,7 @@ async function runDiagnosticPhase(jobId, ctx) {
     intent,
     declaredGenre, genreUnknown,
     uploadType,
+    cacheAudioHash, cacheParamsSig, // cache fiche (migration 031)
   } = ctx;
 
   // ── ATTENTE Fadr + DSP en parallele (avec timeouts independants) ──
@@ -690,6 +776,28 @@ async function runDiagnosticPhase(jobId, ctx) {
     ctx: undefined, // on purge pour eviter de garder le listening en memoire plus longtemps
   });
   console.log('[analyze] done');
+
+  // ── CACHE FICHE FILL (migration 031) ──────────────────────────────
+  // Pipeline classique reussi : on alimente le cache pour les futurs
+  // uploads du meme fichier avec les memes parametres. Fire-and-forget
+  // (les erreurs DB ne doivent pas affecter la reponse au client).
+  // On ne cache QUE si on a une fiche valide — pas la peine de cacher
+  // un mode degrade (fiche null, Claude KO).
+  if (fiche && cacheAudioHash && cacheParamsSig) {
+    saveAnalysisCache(
+      cacheAudioHash,
+      cacheParamsSig,
+      {
+        fiche,
+        listening: listening || null,
+        fadrMetrics: fadrMetrics || null,
+        dspMetrics: dspMetrics || null,
+        stemsMetrics: stemsMetrics || null,
+        stereoMetrics: stereoMetrics || null,
+      },
+      userId || null,
+    );
+  }
 
   // ── COST TRACKING (analysis_cost_logs) ──
   // Insère la ligne de coût de cette analyse dans Supabase.
