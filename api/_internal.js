@@ -99,9 +99,13 @@ router.get('/rag-debug', async (req, res) => {
         couleur: 'chaude',
         mood: 'nostalgique',
       };
-      const chunks = await _ragModule.retrievePureMixContext(testListening);
+      const minSim = req.query.min_sim !== undefined
+        ? Number(req.query.min_sim)
+        : 0.25;
+      const chunks = await _ragModule.retrievePureMixContext(testListening, { minSimilarity: minSim, matchCount: 6 });
+      out.min_similarity_used = minSim;
       out.chunks_count = chunks?.length || 0;
-      out.sample_chunks = (chunks || []).slice(0, 3).map(c => ({
+      out.sample_chunks = (chunks || []).slice(0, 6).map(c => ({
         category: c.category,
         source_file: c.source_file,
         similarity: c.similarity,
