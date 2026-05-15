@@ -86,35 +86,62 @@ router.get('/rag-debug', async (req, res) => {
     supabase_anon_key_present: !!process.env.SUPABASE_ANON_KEY,
     supabase_service_role_present: !!process.env.SUPABASE_SERVICE_ROLE,
     rag_module_loaded: !!(_ragModule && _ragModule.retrievePureMixContext),
+    steps: [],
   };
 
-  if (_ragModule?.retrievePureMixContext) {
+  // Re-implémente la chaîne RAG INLINE avec un step log explicite à chaque
+  // étape pour identifier précisément où ça casse (vs lib/rag.js qui catch
+  // silencieusement et retourne []).
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    const OpenAI = require('openai');
+
+    const testQuery = 'mixing vocals EQ dynamic compression sub bass kick drum stereo width reverb mastering loudness';
+    out.steps.push({ step: 'build_query', query_length: testQuery.length, query_preview: testQuery.slice(0, 100) });
+
+    // OpenAI embed
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const t1 = Date.now();
+    let embedRes;
     try {
-      const testListening = {
-        impression: 'EQ classique ou dynamique ? Un mix electronique dense avec un sub puissant et une voix bien presente',
-        a_travailler: ['EQ classique ou dynamique ?', 'clarte des mediums', 'sub un peu mou'],
-        points_forts: ['voix bien posee', 'spatial soigne'],
-        espace: 'large stereo',
-        dynamique: 'compressee',
-        couleur: 'chaude',
-        mood: 'nostalgique',
-      };
-      const minSim = req.query.min_sim !== undefined
-        ? Number(req.query.min_sim)
-        : 0.25;
-      const chunks = await _ragModule.retrievePureMixContext(testListening, { minSimilarity: minSim, matchCount: 6 });
-      out.min_similarity_used = minSim;
-      out.chunks_count = chunks?.length || 0;
-      out.sample_chunks = (chunks || []).slice(0, 6).map(c => ({
+      embedRes = await openai.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: testQuery,
+      });
+      out.steps.push({ step: 'openai_embed_ok', ms: Date.now() - t1, dims: embedRes.data[0].embedding.length });
+    } catch (e) {
+      out.steps.push({ step: 'openai_embed_FAIL', error: e.message, ms: Date.now() - t1 });
+      return res.json(out);
+    }
+
+    const queryEmbedding = embedRes.data[0].embedding;
+
+    // Supabase RPC
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+      auth: { persistSession: false },
+    });
+    const t2 = Date.now();
+    const { data, error, status, statusText } = await sb.rpc('match_puremix_chunks', {
+      query_embedding: queryEmbedding,
+      match_count: 6,
+      min_similarity: 0.0,
+    });
+    out.steps.push({
+      step: 'supabase_rpc_done',
+      ms: Date.now() - t2,
+      http_status: status,
+      http_statusText: statusText,
+      error: error ? { message: error.message, details: error.details, hint: error.hint, code: error.code } : null,
+      data_kind: data === null ? 'null' : (Array.isArray(data) ? `array(${data.length})` : typeof data),
+      data_preview: Array.isArray(data) ? data.slice(0, 3).map(c => ({
         category: c.category,
         source_file: c.source_file,
         similarity: c.similarity,
-        content_preview: (c.content || '').slice(0, 160),
-      }));
-    } catch (err) {
-      out.rag_error = err.message;
-      out.rag_stack = (err.stack || '').split('\n').slice(0, 6).join('\n');
-    }
+        content_preview: (c.content || '').slice(0, 120),
+      })) : data,
+    });
+  } catch (err) {
+    out.steps.push({ step: 'unhandled_exception', error: err.message, stack: (err.stack || '').split('\n').slice(0, 6).join('\n') });
   }
 
   return res.json(out);
