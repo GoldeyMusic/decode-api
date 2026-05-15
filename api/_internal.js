@@ -58,6 +58,64 @@ function requireSecret(req, res, next) {
   next();
 }
 
+// ─────────────────────────────────────────────────────────────
+// /api/internal/rag-debug — DIAGNOSTIC TEMPORAIRE (à retirer)
+//
+// Vérifie en live :
+//   - le commit déployé (constante DEPLOY_MARKER)
+//   - la présence des env vars OPENAI_API_KEY + SUPABASE_URL
+//   - le chargement du module lib/rag
+//   - une recherche RAG réelle avec un listening de test
+//
+// Protégé par ?secret=… hardcodé. Placée AVANT router.use(requireSecret)
+// pour bypasser le header X-Notify-Secret (qu'on ne connaît pas côté curl).
+// À retirer après diagnostic.
+// ─────────────────────────────────────────────────────────────
+const DEPLOY_MARKER = 'rag-fix-f685eb6';
+let _ragModule = null;
+try { _ragModule = require('../lib/rag'); } catch (_) { /* ignore */ }
+
+router.get('/rag-debug', async (req, res) => {
+  if (req.query.secret !== 'temp-rag-diag-2026-05-15') {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const out = {
+    deploy_marker: DEPLOY_MARKER,
+    openai_key_present: !!process.env.OPENAI_API_KEY,
+    supabase_url_present: !!process.env.SUPABASE_URL,
+    supabase_anon_key_present: !!process.env.SUPABASE_ANON_KEY,
+    supabase_service_role_present: !!process.env.SUPABASE_SERVICE_ROLE,
+    rag_module_loaded: !!(_ragModule && _ragModule.retrievePureMixContext),
+  };
+
+  if (_ragModule?.retrievePureMixContext) {
+    try {
+      const testListening = {
+        impression: 'EQ classique ou dynamique ? Un mix electronique dense avec un sub puissant et une voix bien presente',
+        a_travailler: ['EQ classique ou dynamique ?', 'clarte des mediums', 'sub un peu mou'],
+        points_forts: ['voix bien posee', 'spatial soigne'],
+        espace: 'large stereo',
+        dynamique: 'compressee',
+        couleur: 'chaude',
+        mood: 'nostalgique',
+      };
+      const chunks = await _ragModule.retrievePureMixContext(testListening);
+      out.chunks_count = chunks?.length || 0;
+      out.sample_chunks = (chunks || []).slice(0, 3).map(c => ({
+        category: c.category,
+        source_file: c.source_file,
+        similarity: c.similarity,
+        content_preview: (c.content || '').slice(0, 160),
+      }));
+    } catch (err) {
+      out.rag_error = err.message;
+      out.rag_stack = (err.stack || '').split('\n').slice(0, 6).join('\n');
+    }
+  }
+
+  return res.json(out);
+});
+
 router.use(requireSecret);
 
 // ─── POST /notify-signup ────────────────────────────────────
@@ -221,62 +279,6 @@ router.post('/notify-feedback', async (req, res) => {
     console.error('[internal/notify-feedback] failed:', err.message, err.stack);
     res.status(500).json({ error: 'handler_failed' });
   }
-});
-
-// ─────────────────────────────────────────────────────────────
-// /api/internal/rag-debug — DIAGNOSTIC TEMPORAIRE (à retirer)
-//
-// Vérifie en live :
-//   - le commit déployé (constante DEPLOY_MARKER)
-//   - la présence des env vars OPENAI_API_KEY + SUPABASE_URL
-//   - le chargement du module lib/rag
-//   - une recherche RAG réelle avec un listening de test
-//
-// Protégé par ?secret=… hardcodé (temporaire, à retirer après diagnostic).
-// ─────────────────────────────────────────────────────────────
-const DEPLOY_MARKER = 'rag-fix-f685eb6';
-let _ragModule = null;
-try { _ragModule = require('../lib/rag'); } catch (_) { /* ignore */ }
-
-router.get('/rag-debug', async (req, res) => {
-  if (req.query.secret !== 'temp-rag-diag-2026-05-15') {
-    return res.status(403).json({ error: 'forbidden' });
-  }
-  const out = {
-    deploy_marker: DEPLOY_MARKER,
-    openai_key_present: !!process.env.OPENAI_API_KEY,
-    supabase_url_present: !!process.env.SUPABASE_URL,
-    supabase_anon_key_present: !!process.env.SUPABASE_ANON_KEY,
-    supabase_service_role_present: !!process.env.SUPABASE_SERVICE_ROLE,
-    rag_module_loaded: !!(_ragModule && _ragModule.retrievePureMixContext),
-  };
-
-  if (_ragModule?.retrievePureMixContext) {
-    try {
-      const testListening = {
-        impression: 'EQ classique ou dynamique ? Un mix electronique dense avec un sub puissant et une voix bien presente',
-        a_travailler: ['EQ classique ou dynamique ?', 'clarte des mediums', 'sub un peu mou'],
-        points_forts: ['voix bien posee', 'spatial soigne'],
-        espace: 'large stereo',
-        dynamique: 'compressee',
-        couleur: 'chaude',
-        mood: 'nostalgique',
-      };
-      const chunks = await _ragModule.retrievePureMixContext(testListening);
-      out.chunks_count = chunks?.length || 0;
-      out.sample_chunks = (chunks || []).slice(0, 3).map(c => ({
-        category: c.category,
-        source_file: c.source_file,
-        similarity: c.similarity,
-        content_preview: (c.content || '').slice(0, 160),
-      }));
-    } catch (err) {
-      out.rag_error = err.message;
-      out.rag_stack = (err.stack || '').split('\n').slice(0, 6).join('\n');
-    }
-  }
-
-  return res.json(out);
 });
 
 module.exports = router;
