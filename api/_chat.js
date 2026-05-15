@@ -85,9 +85,22 @@ router.post('/', async (req, res) => {
         try {
           const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
           const query = lastUserMsg?.content || lastUserMsg?.text || '';
-          const ragInput = query
-            ? { summary: query, observations: [query] }
-            : listening;
+          // On garde toute l'écoute Gemini (impression, points_forts, espace,
+          // dynamique, couleur, mood…) qui ancre la recherche dans le contexte
+          // sonore du morceau, ET on injecte la question utilisateur à deux
+          // endroits pour qu'elle pèse dans l'embedding :
+          //   - en tête de `impression` (1er champ concaténé par buildQueryFromListening)
+          //   - dans `a_travailler` (le champ "problèmes à résoudre")
+          // Sans ça, une question courte type "EQ classique ou dynamique ?" se
+          // noierait dans 1500 chars de description sonore et la recherche
+          // remonterait des extraits PureMix génériques au lieu de chunks ciblés.
+          const ragInput = {
+            ...listening,
+            impression: query
+              ? `${query} . ${listening?.impression || ''}`.trim()
+              : listening?.impression,
+            a_travailler: [...(listening?.a_travailler || []), query].filter(Boolean),
+          };
           embedTokens = estimateEmbedTokens(query || JSON.stringify(ragInput).slice(0, 500));
           const pmChunks = await retrievePureMixContext(ragInput);
           if (pmChunks && pmChunks.length > 0) {
